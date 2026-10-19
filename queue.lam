@@ -1,0 +1,390 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — a durable PostgreSQL job queue (table ``<prefix>queue``):
+# priorities, delayed jobs, de-duplication keys, claims with
+# ``FOR UPDATE SKIP LOCKED`` and expiring leases, retries with capped
+# exponential backoff and jitter, dead letters, and statistics.
+#
+# Every job row is in one state:
+#   pending   waiting for ``run_at`` (``attempts > 0``: failed, will retry)
+#   running   claimed by a worker until ``locked_until``
+#   done      completed
+#   dead      failed ``max_attempts`` times or was buried (dead letter)
+#   cancelled cancelled before it ran
+
+from lamdb import Db
+from lamerrors import Result, Error
+from lamjson import Json
+from .schema import Jobs, JobsSql, JobsRow, JobsDefaultPrefix
+from .backoff import JobBackoff
+from .notify import JobsWake
+
+#- Error kind a handler returns to fail a job without retrying it
+   (``JobQueue.permanent(message)`` builds one). -#
+const JobsPermanentError: str = "JobsPermanentError"
+
+const JobsQueueColumns: str = "id, queue, state, payload::text AS payload, priority, COALESCE(unique_key, '') AS unique_key, attempts, max_attempts, EXTRACT(EPOCH FROM run_at)::bigint AS run_at, COALESCE(locked_by, '') AS locked_by, COALESCE(EXTRACT(EPOCH FROM locked_until)::bigint, 0) AS locked_until, last_error, EXTRACT(EPOCH FROM created_at)::bigint AS created_at, COALESCE(EXTRACT(EPOCH FROM finished_at)::bigint, 0) AS finished_at"
+
+#- One job. ``attempt`` counts claims so far (1 during the first run);
+   times are Unix seconds (0 = not set). -#
+class QueuedJob {
+    func init(self, id: int, queue: str) {
+        self.id: int = id
+        self.queue: str = queue
+        self.state: str = ""
+        self.payload: json = None
+        self.priority: int = 0
+        self.uniqueKey: str = ""
+        self.attempt: int = 0
+        self.maxAttempts: int = 0
+        self.runAt: int = 0
+        self.lockedBy: str = ""
+        self.lockedUntil: int = 0
+        self.lastError: str = ""
+        self.createdAt: int = 0
+        self.finishedAt: int = 0
+    }
+
+    static func fromRow(row: dict[str, any]) -> QueuedJob {
+        job: QueuedJob = QueuedJob(JobsRow.int(row, "id"), JobsRow.str(row, "queue"))
+        job.state = JobsRow.str(row, "state")
+        decoded: Result[json] = Json.decode(JobsRow.str(row, "payload"))
+        if decoded.ok() {
+            job.payload = decoded.unwrap()
+        }
+        job.priority = JobsRow.int(row, "priority")
+        job.uniqueKey = JobsRow.str(row, "unique_key")
+        job.attempt = JobsRow.int(row, "attempts")
+        job.maxAttempts = JobsRow.int(row, "max_attempts")
+        job.runAt = JobsRow.int(row, "run_at")
+        job.lockedBy = JobsRow.str(row, "locked_by")
+        job.lockedUntil = JobsRow.int(row, "locked_until")
+        job.lastError = JobsRow.str(row, "last_error")
+        job.createdAt = JobsRow.int(row, "created_at")
+        job.finishedAt = JobsRow.int(row, "finished_at")
+        return job
+    }
+
+    #- True when this run is the last allowed attempt. -#
+    func lastAttempt(self) -> bool {
+        return self.attempt >= self.maxAttempts
+    }
+
+    func __json__(self) -> json {
+        return {"id": self.id, "queue": self.queue, "state": self.state, "payload": self.payload, "priority": self.priority, "uniqueKey": self.uniqueKey, "attempt": self.attempt, "maxAttempts": self.maxAttempts, "runAt": self.runAt, "lockedBy": self.lockedBy, "lockedUntil": self.lockedUntil, "lastError": self.lastError, "createdAt": self.createdAt, "finishedAt": self.finishedAt}
+    }
+}
+
+#- Queue counters. ``pending`` includes ``scheduled`` (``run_at`` in the
+   future) and ``failed`` (waiting for a retry); ``lagSeconds`` is the age
+   of the oldest due pending job (0 when none is due). -#
+class QueueStats {
+    func init(self, queue: str) {
+        self.queue: str = queue
+        self.pending: int = 0
+        self.scheduled: int = 0
+        self.running: int = 0
+        self.failed: int = 0
+        self.dead: int = 0
+        self.done: int = 0
+        self.cancelled: int = 0
+        self.lagSeconds: int = 0
+    }
+
+    static func fromRow(queue: str, row: dict[str, any]) -> QueueStats {
+        out: QueueStats = QueueStats(queue)
+        out.pending = JobsRow.int(row, "pending")
+        out.scheduled = JobsRow.int(row, "scheduled")
+        out.running = JobsRow.int(row, "running")
+        out.failed = JobsRow.int(row, "failed")
+        out.dead = JobsRow.int(row, "dead")
+        out.done = JobsRow.int(row, "done")
+        out.cancelled = JobsRow.int(row, "cancelled")
+        out.lagSeconds = JobsRow.int(row, "lag")
+        return out
+    }
+
+    func __json__(self) -> json {
+        return {"queue": self.queue, "pending": self.pending, "scheduled": self.scheduled, "running": self.running, "failed": self.failed, "dead": self.dead, "done": self.done, "cancelled": self.cancelled, "lagSeconds": self.lagSeconds}
+    }
+}
+
+const JobsStatsColumns: str = "COUNT(*) FILTER (WHERE state = 'pending')::bigint AS pending, COUNT(*) FILTER (WHERE state = 'pending' AND run_at > now())::bigint AS scheduled, COUNT(*) FILTER (WHERE state = 'running')::bigint AS running, COUNT(*) FILTER (WHERE state = 'pending' AND attempts > 0)::bigint AS failed, COUNT(*) FILTER (WHERE state = 'dead')::bigint AS dead, COUNT(*) FILTER (WHERE state = 'done')::bigint AS done, COUNT(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled, COALESCE(EXTRACT(EPOCH FROM now() - MIN(run_at) FILTER (WHERE state = 'pending' AND run_at <= now()))::bigint, 0) AS lag"
+
+#- A named queue in the shared ``<prefix>queue`` table. Workers of
+   different queues never see each other's jobs. -#
+class JobQueue {
+    func init(self, db: Db, name: str = "default", owner: str = "", prefix: str = JobsDefaultPrefix) {
+        Jobs.requirePrefix(prefix)
+        if name == "" {
+            throw ValueError("@lam/jobs: queue name must not be empty")
+        }
+        self.db: Db = db
+        self.name: str = name
+        self.owner: str = owner if owner != "" else Jobs.newOwner()
+        self.prefix: str = prefix
+        self.table: str = prefix + "queue"
+        self.channel: str = Jobs.notifyChannel(prefix)
+        self.backoff: JobBackoff = JobBackoff(30, 21600, 0.1)
+        self.maxAttempts: int = 10
+        self.notify: bool = true
+        self.wake: JobsWake = JobsWake()
+    }
+
+    #- Retry delays for ``fail`` (default 30 s doubling to 6 h, 10 % jitter). -#
+    func withBackoff(self, backoff: JobBackoff) -> JobQueue {
+        self.backoff = backoff
+        return self
+    }
+
+    #- Default ``maxAttempts`` of enqueued jobs (default 10). -#
+    func withMaxAttempts(self, maxAttempts: int) -> JobQueue {
+        if maxAttempts < 1 {
+            throw ValueError("@lam/jobs: maxAttempts must be at least 1")
+        }
+        self.maxAttempts = maxAttempts
+        return self
+    }
+
+    #- ``false`` skips the ``pg_notify`` sent by every enqueue. -#
+    func withNotify(self, enabled: bool) -> JobQueue {
+        self.notify = enabled
+        return self
+    }
+
+    #- An ``Error`` that makes ``JobWorkers`` bury the job at once (no
+       retry): ``return Result.Err(JobQueue.permanent("bad payload"))``. -#
+    static func permanent(message: str) -> Error {
+        return Error(JobsPermanentError, message)
+    }
+
+    # ── producing ─────────────────────────────────────────────────────
+
+    #- Adds a job and returns its id. ``runAt`` (Unix seconds, 0 = now)
+       delays it; higher ``priority`` runs first; a non-empty ``uniqueKey``
+       skips the insert (returns 0) while a pending or running job of this
+       queue has the same key; ``maxAttempts`` 0 uses the queue default. -#
+    func enqueue(self, payload: json, runAt: int = 0, priority: int = 0, uniqueKey: str = "", maxAttempts: int = 0) -> Result[int] {
+        id: int = self.enqueueIn(self.db, payload, runAt, priority, uniqueKey, maxAttempts)?
+        if id > 0 {
+            self.wake.wake()
+        }
+        return Result.Ok(id)
+    }
+
+    #- ``enqueue`` through ``conn``, a ``Db`` or the caller's ``Tx``: inside
+       a transaction the job (and its notification) exists only if the
+       transaction commits, which makes "write + enqueue" atomic. -#
+    func enqueueIn(self, conn: JobsSql, payload: json, runAt: int = 0, priority: int = 0, uniqueKey: str = "", maxAttempts: int = 0) -> Result[int] {
+        attempts: int = maxAttempts if maxAttempts > 0 else self.maxAttempts
+        key: any = None
+        if uniqueKey != "" {
+            key = uniqueKey
+        }
+        text: str = Json.encode(payload)?
+        t: str = self.table
+        rows: list[dict[str, any]] = conn.query(f"INSERT INTO {t} (queue, payload, priority, unique_key, max_attempts, run_at) VALUES (?, ?::jsonb, ?, ?, ?, CASE WHEN ?::bigint > 0 THEN to_timestamp(?::bigint) ELSE now() END) ON CONFLICT (queue, unique_key) WHERE unique_key IS NOT NULL AND state IN ('pending', 'running') DO NOTHING RETURNING id", [self.name, text, priority, key, attempts, runAt, runAt])?
+        if len(rows) == 0 {
+            return Result.Ok(0)
+        }
+        id: int = JobsRow.int(rows[0], "id")
+        if self.notify {
+            _ = conn.query("SELECT pg_notify(?, ?)", [self.channel, self.name])?
+        }
+        return Result.Ok(id)
+    }
+
+    # ── consuming ─────────────────────────────────────────────────────
+
+    #- Returns expired claims (a worker died or lost its connection) to
+       ``pending``, or to ``dead`` when they used their last attempt.
+       ``claim`` calls it; returns how many jobs were recovered. -#
+    func recoverExpired(self) -> Result[int] {
+        t: str = self.table
+        return self.db.exec(f"UPDATE {t} SET state = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END, finished_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END, last_error = 'lease expired: ' || COALESCE(locked_by, '') || ' did not finish the job', locked_by = NULL, locked_until = NULL, run_at = now(), updated_at = now() WHERE queue = ? AND state = 'running' AND locked_until < now()", [self.name])
+    }
+
+    #- Claims up to ``limit`` due jobs for ``leaseSeconds``: highest priority
+       first, then oldest ``runAt``. Concurrent claimers never get the same
+       job (``FOR UPDATE SKIP LOCKED``). A claim that is not completed,
+       failed or extended before its lease expires is handed out again. -#
+    func claim(self, limit: int = 1, leaseSeconds: int = 60) -> Result[list[QueuedJob]] {
+        if limit < 1 or leaseSeconds < 1 {
+            return Result.Err(Error("JobsConfigError", "claim limit and leaseSeconds must be positive"))
+        }
+        _ = self.recoverExpired()?
+        t: str = self.table
+        # ``id = ANY(ARRAY(SELECT ... LIMIT n FOR UPDATE SKIP LOCKED))``: the
+        # ARRAY sub-select is an InitPlan that runs exactly once. With
+        # ``id IN (SELECT ...)`` PostgreSQL may plan a nested-loop semi join
+        # that re-runs the locking sub-select for every outer row, skipping
+        # the rows this statement already updated and claiming far more than
+        # ``limit`` jobs. A data-modifying CTE that also locks the rows it
+        # updates can silently skip work, so it is avoided as well.
+        rows: list[dict[str, any]] = self.db.query(f"UPDATE {t} SET state = 'running', attempts = attempts + 1, locked_by = ?, locked_until = now() + make_interval(secs => ?), updated_at = now() WHERE id = ANY(ARRAY(SELECT id FROM {t} WHERE queue = ? AND state = 'pending' AND run_at <= now() ORDER BY priority DESC, run_at, id LIMIT ? FOR UPDATE SKIP LOCKED)) AND state = 'pending' RETURNING {JobsQueueColumns}", [self.owner, leaseSeconds, self.name, limit])?
+        out: list[QueuedJob] = []
+        for row in rows {
+            out.append(QueuedJob.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Extends the lease of a claimed job; ``Ok(false)`` when the claim was
+       lost (expired and handed to another worker, cancelled, ...). -#
+    func extend(self, job: QueuedJob, leaseSeconds: int) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET locked_until = now() + make_interval(secs => ?), updated_at = now() WHERE id = ? AND state = 'running' AND locked_by = ? AND attempts = ?", [leaseSeconds, job.id, self.owner, job.attempt])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Marks a claimed job done; ``Ok(false)`` when the claim was lost. -#
+    func complete(self, job: QueuedJob) -> Result[bool] {
+        return self.completeIn(self.db, job)
+    }
+
+    #- ``complete`` inside the caller's transaction, so the job's own writes
+       and its completion commit together. -#
+    func completeIn(self, conn: JobsSql, job: QueuedJob) -> Result[bool] {
+        n: int = conn.exec(f"UPDATE {self.table} SET state = 'done', finished_at = now(), last_error = '', locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = ? AND state = 'running' AND locked_by = ? AND attempts = ?", [job.id, self.owner, job.attempt])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Records a failed attempt. The job is retried after the backoff delay
+       (``retryAfterSeconds`` >= 0 overrides it) or becomes ``dead`` after
+       its last attempt. Returns the new state, "pending" or "dead" ("" when
+       the claim was lost). -#
+    func fail(self, job: QueuedJob, error: str, retryAfterSeconds: int = -1) -> Result[str] {
+        state: str = "pending"
+        delay: int = 0
+        if job.attempt >= job.maxAttempts {
+            state = "dead"
+        } elif retryAfterSeconds >= 0 {
+            delay = retryAfterSeconds
+        } else {
+            delay = self.backoff.delay(job.attempt)
+        }
+        return self.settle(job, state, error, delay)
+    }
+
+    #- Moves a claimed job to the dead letters at once (a permanent error:
+       retrying cannot help). Returns "dead" ("" when the claim was lost). -#
+    func bury(self, job: QueuedJob, error: str) -> Result[str] {
+        return self.settle(job, "dead", error, 0)
+    }
+
+    func settle(self, job: QueuedJob, state: str, error: str, delay: int) -> Result[str] {
+        text: str = error if error != "" else "failed"
+        n: int = self.db.exec(f"UPDATE {self.table} SET state = ?, run_at = CASE WHEN ? = 'pending' THEN now() + make_interval(secs => ?) ELSE run_at END, finished_at = CASE WHEN ? = 'dead' THEN now() ELSE NULL END, last_error = ?, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = ? AND state = 'running' AND locked_by = ? AND attempts = ?", [state, state, delay, state, text, job.id, self.owner, job.attempt])?
+        if n == 0 {
+            return Result.Ok("")
+        }
+        return Result.Ok(state)
+    }
+
+    # ── administration ────────────────────────────────────────────────
+
+    #- Re-queues a dead or cancelled job (attempts start again) or makes a
+       delayed pending job due now. ``Ok(false)`` for other states. -#
+    func retry(self, id: int) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET attempts = CASE WHEN state = 'pending' THEN attempts ELSE 0 END, state = 'pending', run_at = now(), finished_at = NULL, locked_by = NULL, locked_until = NULL, updated_at = now() WHERE id = ? AND queue = ? AND state IN ('dead', 'cancelled', 'pending')", [id, self.name])?
+        if n > 0 {
+            self.wake.wake()
+        }
+        return Result.Ok(n > 0)
+    }
+
+    #- Re-queues up to ``limit`` dead letters (0 = all); returns how many. -#
+    func retryDead(self, limit: int = 0) -> Result[int] {
+        t: str = self.table
+        cap: any = None
+        if limit > 0 {
+            cap = limit
+        }
+        n: int = self.db.exec(f"UPDATE {t} SET state = 'pending', attempts = 0, run_at = now(), finished_at = NULL, updated_at = now() WHERE id = ANY(ARRAY(SELECT id FROM {t} WHERE queue = ? AND state = 'dead' ORDER BY id LIMIT ?::bigint FOR UPDATE SKIP LOCKED)) AND state = 'dead'", [self.name, cap])?
+        if n > 0 {
+            self.wake.wake()
+        }
+        return Result.Ok(n)
+    }
+
+    #- Cancels a pending job; ``Ok(false)`` when it is running or finished. -#
+    func cancel(self, id: int) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET state = 'cancelled', finished_at = now(), updated_at = now() WHERE id = ? AND queue = ? AND state = 'pending'", [id, self.name])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Cancels the pending job holding ``uniqueKey``. -#
+    func cancelKey(self, uniqueKey: str) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET state = 'cancelled', finished_at = now(), updated_at = now() WHERE queue = ? AND unique_key = ? AND state = 'pending'", [self.name, uniqueKey])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Deletes finished jobs (done and cancelled, plus dead ones when
+       ``includeDead``) that finished more than ``olderThanSeconds`` ago. -#
+    func purge(self, olderThanSeconds: int, includeDead: bool = true) -> Result[int] {
+        states: str = "'done', 'cancelled', 'dead'" if includeDead else "'done', 'cancelled'"
+        return self.db.exec(f"DELETE FROM {self.table} WHERE queue = ? AND state IN ({states}) AND finished_at < now() - make_interval(secs => ?)", [self.name, olderThanSeconds])
+    }
+
+    #- The job ``id`` of this queue; ``JobsNotFound`` when it does not exist. -#
+    func get(self, id: int) -> Result[QueuedJob] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsQueueColumns} FROM {self.table} WHERE id = ? AND queue = ?", [id, self.name])?
+        if len(rows) == 0 {
+            return Result.Err(Error("JobsNotFound", f"no job {id} in queue {self.name}"))
+        }
+        return Result.Ok(QueuedJob.fromRow(rows[0]))
+    }
+
+    #- Jobs in ``state`` ("" = any), newest first. -#
+    func list(self, state: str = "", limit: int = 100) -> Result[list[QueuedJob]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsQueueColumns} FROM {self.table} WHERE queue = ? AND (? = '' OR state = ?) ORDER BY id DESC LIMIT ?", [self.name, state, state, limit])?
+        out: list[QueuedJob] = []
+        for row in rows {
+            out.append(QueuedJob.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- The dead letters, newest first. -#
+    func dead(self, limit: int = 100) -> Result[list[QueuedJob]] {
+        return self.list("dead", limit)
+    }
+
+    #- Counters of this queue. -#
+    func stats(self) -> Result[QueueStats] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsStatsColumns} FROM {self.table} WHERE queue = ?", [self.name])?
+        return Result.Ok(QueueStats.fromRow(self.name, rows[0]))
+    }
+
+    #- Counters of every queue under ``prefix``, by queue name. -#
+    static func statsAll(db: Db, prefix: str = JobsDefaultPrefix) -> Result[dict[str, QueueStats]] {
+        if not Jobs.checkPrefix(prefix) {
+            return Result.Err(Error("JobsConfigError", f"invalid table prefix {prefix}"))
+        }
+        rows: list[dict[str, any]] = db.query(f"SELECT queue, {JobsStatsColumns} FROM {prefix}queue GROUP BY queue ORDER BY queue", [])?
+        out: dict[str, QueueStats] = {}
+        for row in rows {
+            name: str = JobsRow.str(row, "queue")
+            out[name] = QueueStats.fromRow(name, row)
+        }
+        return Result.Ok(out)
+    }
+
+    #- Gauges for a metrics endpoint: ``queue_<name>_pending``,
+       ``_running``, ``_failed``, ``_dead`` and ``_lag_seconds``. -#
+    func gauges(self) -> Result[dict[str, int]] {
+        s: QueueStats = self.stats()?
+        key: str = "queue_" + self.name.replace("-", "_").replace(".", "_").replace(":", "_").replace(" ", "_")
+        out: dict[str, int] = {}
+        out[key + "_pending"] = s.pending
+        out[key + "_running"] = s.running
+        out[key + "_failed"] = s.failed
+        out[key + "_dead"] = s.dead
+        out[key + "_lag_seconds"] = s.lagSeconds
+        return Result.Ok(out)
+    }
+}
+
+func main() {
+    pass
+}

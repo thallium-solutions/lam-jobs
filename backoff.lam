@@ -1,0 +1,83 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — capped exponential backoff with jitter for queue retries.
+
+from lamrandom import Random
+
+#- Retry delays: ``base * 2^(attempt - 1)`` seconds, capped at ``maxSeconds``,
+   minus a random fraction of up to ``jitter`` (0.0-1.0) of the delay so
+   retries of jobs that failed together spread out. With the defaults
+   (30 s, 6 h cap, 10 % jitter) attempt 1 waits 27-30 s, attempt 2 54-60 s,
+   ... and attempt 11 onward 5.4-6 h. ``base = 0`` retries immediately. -#
+class JobBackoff {
+    func init(self, baseSeconds: int = 30, maxSeconds: int = 21600, jitter: float = 0.1) {
+        self.baseSeconds: int = baseSeconds if baseSeconds > 0 else 0
+        self.maxSeconds: int = maxSeconds if maxSeconds > 0 else 0
+        j: float = jitter
+        if j < 0.0 {
+            j = 0.0
+        }
+        if j > 1.0 {
+            j = 1.0
+        }
+        self.jitter: float = j
+    }
+
+    #- The delay before retry number ``attempt`` (1 = first retry) without
+       jitter. -#
+    func ceiling(self, attempt: int) -> int {
+        if self.baseSeconds == 0 {
+            return 0
+        }
+        delay: int = self.baseSeconds
+        n: int = attempt
+        while n > 1 {
+            if delay >= self.maxSeconds {
+                break
+            }
+            delay = delay * 2
+            n -= 1
+        }
+        if delay > self.maxSeconds {
+            delay = self.maxSeconds
+        }
+        return delay
+    }
+
+    #- The jittered delay for ``attempt`` given ``unit`` in [0, 1) (0 means
+       no reduction): deterministic, for tests. -#
+    func delayWith(self, attempt: int, unit: float) -> int {
+        ceiling: int = self.ceiling(attempt)
+        u: float = unit
+        if u < 0.0 {
+            u = 0.0
+        }
+        if u > 1.0 {
+            u = 1.0
+        }
+        reduction: int = int(float(ceiling) * self.jitter * u)
+        return ceiling - reduction
+    }
+
+    #- The jittered delay for ``attempt`` in seconds. -#
+    func delay(self, attempt: int) -> int {
+        if self.jitter == 0.0 {
+            return self.ceiling(attempt)
+        }
+        return self.delayWith(attempt, Random.randFloat())
+    }
+
+    #- The un-jittered delays of the first ``attempts`` retries. -#
+    func schedule(self, attempts: int) -> list[int] {
+        out: list[int] = []
+        for i in range(attempts) {
+            out.append(self.ceiling(i + 1))
+        }
+        return out
+    }
+}
+
+func main() {
+    pass
+}

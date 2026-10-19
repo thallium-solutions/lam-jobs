@@ -1,0 +1,12 @@
+@lam/jobs
+
+Copyright 2026 Thallium Solutions di Busconi Alessandro.
+
+This product includes software developed by Thallium Solutions di Busconi
+Alessandro.
+
+@lam/jobs is a Lammergeier third-party library for PostgreSQL-backed leases,
+job scheduling, job health, instance heartbeats and durable job queues. It
+uses no Go modules beyond those linked by the Lammergeier standard library:
+the PostgreSQL driver github.com/lib/pq (used through lamdb and for
+LISTEN/NOTIFY) is distributed under its own MIT license by its authors.

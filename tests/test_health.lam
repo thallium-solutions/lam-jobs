@@ -1,0 +1,113 @@
+# Test: @lam/jobs JobHealth — success/failure recording, consecutive
+# failures and their reset, last error and duration, measure() with Ok,
+# Err and exceptions, failing(threshold), stale(), oldestSuccessAge(),
+# metrics gauges, JSON views and forget().
+#
+# requires: database
+# expect: empty oldest age: -1
+# expect: not found: JobsNotFound
+# expect: after success: ok=true failures=0 count=12 duration=40 age=0
+# expect: after 3 failures: ok=false consecutive=3 lastError=smtp down successes=1 failures=3
+# expect: healthy: false true false
+# expect: failing(3): mail
+# expect: failing(1): billing,mail
+# expect: reset by success: consecutive=0 ok=true
+# expect: measure ok: 5 recorded count 5
+# expect: measure err: Remote recorded error remote said no
+# expect: measure exception: ValueError consecutive 2
+# expect: stale(3600): never-ran
+# expect: list: billing,mail,measured,never-ran
+# expect: oldest age >= 0: true
+# expect: gauges: total=4 failing=0 mail_age=0 never=-1
+# expect: json: {"consecutiveFailures":0,"failures":3,"lastCount":7,"lastDurationMs":3,"lastError":"smtp down","name":"mail"}
+# expect: forget: true false
+
+from @lam/jobs import Jobs, JobHealth
+# JobStatus from its module: lamc 2.1 loses the method types of classes
+# re-exported by the package root, which json values need.
+from @lam/jobs/health import JobStatus
+from lamerrors import Result, Error
+from lamdb import Db
+from lamenv import Env
+
+func five() -> Result[int] {
+    return Result.Ok(5)
+}
+
+func remoteFails() -> Result[int] {
+    return Result.Err(Error("Remote", "remote said no"))
+}
+
+func explodes() -> Result[int] {
+    throw ValueError("exploded")
+}
+
+# Outside the do block: lamc 2.1 cannot compile try/catch inside do/catch.
+func measureThrows(h: JobHealth) -> str {
+    try {
+        _ = h.measure("measured", explodes)
+    } catch ValueError as _ex {
+        return "ValueError"
+    }
+    return "none"
+}
+
+func names(items: list[JobStatus]) -> str {
+    return ",".join([s.name for s in items])
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_health_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        h: JobHealth = JobHealth(db, prefix)
+        print(f"empty oldest age: {h.oldestSuccessAge()?}")
+        missing: Result[JobStatus] = h.get("mail")
+        print(f"not found: {missing.error.kind}")
+
+        _ = h.success("mail", 40, 12)?
+        s: JobStatus = h.get("mail")?
+        print(f"after success: ok={s.ok()} failures={s.consecutiveFailures} count={s.lastCount} duration={s.lastDurationMs} age={s.lastSuccessAgeSeconds}")
+        _ = h.failure("mail", "timeout", 10)?
+        _ = h.record("mail", "refused", 11)?
+        _ = h.failure("mail", "smtp down", 12)?
+        s = h.get("mail")?
+        print(f"after 3 failures: ok={s.ok()} consecutive={s.consecutiveFailures} lastError={s.lastError} successes={s.successes} failures={s.failures}")
+        print(f"healthy: {s.healthy(3)} {s.healthy(4)} {s.healthy(4, 0) and false}")
+        _ = h.failure("billing", "stripe 500", 1)?
+        print(f"failing(3): {names(h.failing(3)?)}")
+        print(f"failing(1): {names(h.failing(1)?)}")
+        _ = h.record("mail", "", 3, 7)?
+        s = h.get("mail")?
+        print(f"reset by success: consecutive={s.consecutiveFailures} ok={s.ok()}")
+
+        r: Result[int] = h.measure("measured", five)
+        m: JobStatus = h.get("measured")?
+        print(f"measure ok: {r.unwrap()} recorded count {m.lastCount}")
+        e: Result[int] = h.measure("measured", remoteFails)
+        m = h.get("measured")?
+        print(f"measure err: {e.error.kind} recorded error {m.lastError}")
+        caught: str = measureThrows(h)
+        m = h.get("measured")?
+        print(f"measure exception: {caught} consecutive {m.consecutiveFailures}")
+
+        _ = h.failure("never-ran", "boot", 0)?
+        _ = h.success("billing", 1, 1)?
+        print(f"stale(3600): {names(h.stale(3600)?)}")
+        print(f"list: {names(h.list()?)}")
+        oldest: int = h.oldestSuccessAge()?
+        print(f"oldest age >= 0: {oldest >= 0}")
+        g: dict[str, int] = h.gauges(3)?
+        print(f"gauges: total={g['jobs_total']} failing={g['jobs_failing']} mail_age={g['job_mail_success_age_seconds']} never={g['job_never_ran_success_age_seconds']}")
+        s = h.get("mail")?
+        view: json = json(s)
+        trimmed: json = {"name": view.name, "consecutiveFailures": view.consecutiveFailures, "failures": view.failures, "lastCount": view.lastCount, "lastDurationMs": view.lastDurationMs, "lastError": view.lastError}
+        print(f"json: {trimmed}")
+        print(f"forget: {h.forget('mail')?} {h.forget('mail')?}")
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

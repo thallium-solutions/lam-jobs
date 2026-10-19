@@ -1,0 +1,162 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — liveness of service instances (table ``<prefix>instances``):
+# each process beats every few seconds; status pages count the instances
+# of a component seen recently.
+
+from lamdb import Db
+from lamerrors import Result, Error
+from lamconcurrency import Atomic, WaitGroup
+from lamlog import Log
+from .schema import Jobs, JobsRow, JobsDefaultPrefix
+from .keeper import JobsSignal
+
+#- Default window in which an instance counts as alive. -#
+const JobsAliveSeconds: int = 90
+
+#- One instance row. ``alive`` means seen within the window passed to
+   ``InstanceHeartbeat.list`` (default 90 s). -#
+class InstanceInfo {
+    func init(self, component: str, instance: str) {
+        self.component: str = component
+        self.instance: str = instance
+        self.version: str = ""
+        self.host: str = ""
+        self.startedAt: int = 0
+        self.seenAt: int = 0
+        self.ageSeconds: int = 0
+        self.alive: bool = false
+    }
+
+    static func fromRow(row: dict[str, any]) -> InstanceInfo {
+        out: InstanceInfo = InstanceInfo(JobsRow.str(row, "component"), JobsRow.str(row, "instance"))
+        out.version = JobsRow.str(row, "version")
+        out.host = JobsRow.str(row, "host")
+        out.startedAt = JobsRow.int(row, "started_at")
+        out.seenAt = JobsRow.int(row, "seen_at")
+        out.ageSeconds = JobsRow.int(row, "age")
+        out.alive = JobsRow.bool(row, "alive")
+        return out
+    }
+
+    func __json__(self) -> json {
+        return {"component": self.component, "instance": self.instance, "version": self.version, "host": self.host, "startedAt": self.startedAt, "seenAt": self.seenAt, "ageSeconds": self.ageSeconds, "alive": self.alive}
+    }
+}
+
+#- Records that this process serves ``component`` (e.g. "api", "worker")
+   and answers liveness questions about every instance. -#
+class InstanceHeartbeat {
+    func init(self, db: Db, component: str, version: str = "", instance: str = "", prefix: str = JobsDefaultPrefix) {
+        Jobs.requirePrefix(prefix)
+        if component == "" {
+            throw ValueError("@lam/jobs: heartbeat component must not be empty")
+        }
+        self.db: Db = db
+        self.component: str = component
+        self.version: str = version
+        self.instance: str = instance if instance != "" else Jobs.newOwner()
+        self.host: str = Jobs.hostname()
+        self.prefix: str = prefix
+        self.table: str = prefix + "instances"
+        self.everySeconds: int = 20
+        self.started: Atomic = Atomic(0)
+        self.signal: JobsSignal = JobsSignal()
+        self.group: WaitGroup = WaitGroup()
+    }
+
+    #- Beat interval of ``start``/``run`` (default 20 s; keep it well below
+       the ``alive`` window). -#
+    func withInterval(self, seconds: int) -> InstanceHeartbeat {
+        self.everySeconds = seconds if seconds > 0 else 1
+        return self
+    }
+
+    #- Records one beat now. -#
+    func beat(self) -> Result[bool] {
+        _ = self.db.exec(f"INSERT INTO {self.table} (component, instance, version, host, started_at, seen_at) VALUES (?, ?, ?, ?, now(), now()) ON CONFLICT (component, instance) DO UPDATE SET seen_at = now(), version = EXCLUDED.version, host = EXCLUDED.host", [self.component, self.instance, self.version, self.host])?
+        return Result.Ok(true)
+    }
+
+    async func loop(self) {
+        while true {
+            try {
+                r: Result[bool] = self.beat()
+                if not r.ok() {
+                    Log.warn(f"@lam/jobs heartbeat {self.component}: {JobsRow.errText(r.error)}")
+                }
+            } catch err {
+                Log.error(f"@lam/jobs heartbeat {self.component}: {err}")
+            }
+            if not self.signal.sleep(self.everySeconds * 1000) {
+                break
+            }
+        }
+        self.group.done()
+    }
+
+    #- Beats in the background until ``stop()`` (idempotent). -#
+    func start(self) {
+        if not self.started.compareAndSwap(0, 1) {
+            return
+        }
+        self.group.add(1)
+        _ = self.loop()
+    }
+
+    #- ``start()`` and block until ``stop()`` is called elsewhere. -#
+    func run(self) {
+        self.start()
+        self.group.wait()
+    }
+
+    #- Stops beating and removes this instance's row, so status pages see
+       a clean shutdown at once instead of after the window. -#
+    func stop(self) -> Result[bool] {
+        self.signal.fire()
+        if self.started.get() == 1 {
+            self.group.wait()
+        }
+        _ = self.db.exec(f"DELETE FROM {self.table} WHERE component = ? AND instance = ?", [self.component, self.instance])?
+        return Result.Ok(true)
+    }
+
+    #- How many instances of ``component`` beat within ``withinSeconds``. -#
+    func alive(self, component: str, withinSeconds: int = JobsAliveSeconds) -> Result[int] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT COUNT(*)::bigint AS n FROM {self.table} WHERE component = ? AND seen_at > now() - make_interval(secs => ?::bigint)", [component, withinSeconds])?
+        return Result.Ok(JobsRow.int(rows[0], "n"))
+    }
+
+    #- Alive instance counts of every known component (0 for components
+       whose instances all went silent). -#
+    func aliveByComponent(self, withinSeconds: int = JobsAliveSeconds) -> Result[dict[str, int]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT component, COUNT(*) FILTER (WHERE seen_at > now() - make_interval(secs => ?::bigint))::bigint AS n FROM {self.table} GROUP BY component ORDER BY component", [withinSeconds])?
+        out: dict[str, int] = {}
+        for row in rows {
+            out[JobsRow.str(row, "component")] = JobsRow.int(row, "n")
+        }
+        return Result.Ok(out)
+    }
+
+    #- Every instance row (``component`` "" = all components), newest
+       beat first. -#
+    func list(self, component: str = "", withinSeconds: int = JobsAliveSeconds) -> Result[list[InstanceInfo]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT component, instance, version, host, EXTRACT(EPOCH FROM started_at)::bigint AS started_at, EXTRACT(EPOCH FROM seen_at)::bigint AS seen_at, GREATEST(0, EXTRACT(EPOCH FROM now() - seen_at))::bigint AS age, seen_at > now() - make_interval(secs => ?::bigint) AS alive FROM {self.table} WHERE (?::text = '' OR component = ?::text) ORDER BY seen_at DESC, component, instance", [withinSeconds, component, component])?
+        out: list[InstanceInfo] = []
+        for row in rows {
+            out.append(InstanceInfo.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Deletes rows of instances silent for more than ``olderThanSeconds``
+       (crashed processes never remove their row). -#
+    func prune(self, olderThanSeconds: int) -> Result[int] {
+        return self.db.exec(f"DELETE FROM {self.table} WHERE seen_at < now() - make_interval(secs => ?::bigint)", [olderThanSeconds])
+    }
+}
+
+func main() {
+    pass
+}

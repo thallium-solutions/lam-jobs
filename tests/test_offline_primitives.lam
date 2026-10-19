@@ -1,0 +1,140 @@
+# Test: @lam/jobs offline building blocks — prefix validation, the schema
+# DDL list, row conversions, the broadcast wake-up, the stop signal, the
+# background keeper, constructor validation and the PostgreSQL-only guard
+# (checked against an in-memory SQLite database).
+#
+# expect: prefixes: true true true false false false false
+# expect: schema version: 1 steps 1 statements 9
+# expect: ddl prefixed: true
+# expect: channel: billing_queue
+# expect: rows: 42 7 0 true false hello 12
+# expect: wake timeout: false
+# expect: wake woken: true
+# expect: wake closed: true true
+# expect: signal: true false true
+# expect: keeper calls >= 3: true
+# expect: keeper stopped by fn: 2
+# expect: permanent kind: JobsPermanentError
+# expect: bad prefix: ValueError
+# expect: bad queue: ValueError
+# expect: bad concurrency: ValueError
+# expect: bad interval: ValueError
+# expect: bad cron: ValueError
+# expect: duplicate job: ValueError
+# expect: sqlite refused: JobsConfigError
+# expect: invalid prefix result: JobsConfigError
+# expect: owner unique: true
+# expect: owner shape: true
+
+from @lam/jobs import Jobs, JobsRow, JobsWake, JobsSignal, JobsKeeper, JobQueue, JobLeases, JobWorkers, JobScheduler, QueuedJob, JobsSchemaVersion
+from lamerrors import Result, Error
+from lamconcurrency import Atomic
+from lamdb import Db
+from lamtime import Time
+
+class Counter {
+    func init(self, stopAt: int) {
+        self.calls: Atomic = Atomic(0)
+        self.stopAt: int = stopAt
+    }
+
+    func hit(self) -> bool {
+        n: int = self.calls.increment()
+        return self.stopAt <= 0 or n < self.stopAt
+    }
+}
+
+func okHandler(job: QueuedJob) -> Result[bool] {
+    return Result.Ok(true)
+}
+
+async func waitFor(wake: JobsWake, ms: int) -> bool {
+    return wake.wait(ms)
+}
+
+func noop() -> Result[int] {
+    return Result.Ok(0)
+}
+
+func thrown(fn: func() -> any) -> str {
+    try {
+        _ = fn()
+    } catch ValueError as e {
+        return "ValueError"
+    } catch err {
+        return f"other: {err}"
+    }
+    return "none"
+}
+
+func main() {
+    print(f"prefixes: {Jobs.checkPrefix('lam_jobs_')} {Jobs.checkPrefix('_x')} {Jobs.checkPrefix('app2_')} {Jobs.checkPrefix('')} {Jobs.checkPrefix('Bad_')} {Jobs.checkPrefix('x; DROP')} {Jobs.checkPrefix('a2345678901234567890123456789012345678901')}")
+    steps: list[list[str]] = Jobs.migrations("lam_jobs_")
+    print(f"schema version: {JobsSchemaVersion} steps {len(steps)} statements {len(steps[0])}")
+    prefixed: bool = true
+    for statement in steps[0] {
+        if not statement.contains("lam_jobs_") {
+            prefixed = false
+        }
+    }
+    print(f"ddl prefixed: {prefixed}")
+    print(f"channel: {Jobs.notifyChannel('billing_')}")
+
+    row: dict[str, any] = {"a": 42, "b": "7", "c": None, "d": "t", "e": "false", "f": "hello"}
+    big: int = 12
+    row["g"] = big
+    print(f"rows: {JobsRow.int(row, 'a')} {JobsRow.int(row, 'b')} {JobsRow.int(row, 'missing')} {JobsRow.bool(row, 'd')} {JobsRow.bool(row, 'e')} {JobsRow.str(row, 'f')} {JobsRow.str(row, 'g')}")
+
+    wake: JobsWake = JobsWake()
+    print(f"wake timeout: {wake.wait(20)}")
+    pending = waitFor(wake, 5000)
+    Time.sleepMs(30)
+    wake.wake()
+    woken: bool = await pending
+    print(f"wake woken: {woken}")
+    wake.close()
+    print(f"wake closed: {wake.wait(5000)} {wake.isClosed()}")
+
+    signal: JobsSignal = JobsSignal()
+    first: bool = signal.sleep(10)
+    signal.fire()
+    signal.fire()
+    print(f"signal: {first} {signal.sleep(5000)} {signal.isFired()}")
+
+    counter: Counter = Counter(0)
+    keeper: JobsKeeper = JobsKeeper(20, counter.hit)
+    keeper.start()
+    keeper.start()
+    Time.sleepMs(150)
+    keeper.stop()
+    print(f"keeper calls >= 3: {counter.calls.get() >= 3}")
+    limited: Counter = Counter(2)
+    keeper2: JobsKeeper = JobsKeeper(10, limited.hit)
+    keeper2.start()
+    Time.sleepMs(120)
+    keeper2.stop()
+    print(f"keeper stopped by fn: {limited.calls.get()}")
+
+    print(f"permanent kind: {JobQueue.permanent('bad payload').kind}")
+
+    db: Db = Db.connect("sqlite", ":memory:").unwrap()
+    print(f"bad prefix: {thrown(lambda() -> any: JobLeases(db, '', 'Bad-'))}")
+    print(f"bad queue: {thrown(lambda() -> any: JobQueue(db, ''))}")
+    queue: JobQueue = JobQueue(db, "q")
+    print(f"bad concurrency: {thrown(lambda() -> any: JobWorkers(queue, okHandler, 0))}")
+    sched: JobScheduler = JobScheduler(db)
+    print(f"bad interval: {thrown(lambda() -> any: sched.every('x', 0, noop))}")
+    print(f"bad cron: {thrown(lambda() -> any: sched.cron('y', '61 * * * *', noop))}")
+    sched.every("z", 10, noop)
+    print(f"duplicate job: {thrown(lambda() -> any: sched.every('z', 20, noop))}")
+
+    refused: Result[int] = Jobs.migrate(db)
+    print(f"sqlite refused: {refused.error.kind}")
+    invalid: Result[int] = Jobs.schemaVersion(db, "no-dash")
+    print(f"invalid prefix result: {invalid.error.kind}")
+
+    a: str = Jobs.newOwner()
+    b: str = Jobs.newOwner()
+    print(f"owner unique: {a != b}")
+    print(f"owner shape: {len(a.split(':')) == 3}")
+}

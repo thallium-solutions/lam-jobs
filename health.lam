@@ -1,0 +1,197 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — per-job outcome tracking (table ``<prefix>health``) for status
+# pages, alerts and metrics.
+
+from lamdb import Db
+from lamerrors import Result, Error
+from lamtime import Time
+from .schema import Jobs, JobsRow, JobsDefaultPrefix
+
+#- The recorded health of one job. Times are Unix seconds (0 = never);
+   ``lastSuccessAgeSeconds`` is -1 when the job never succeeded. -#
+class JobStatus {
+    func init(self, name: str) {
+        self.name: str = name
+        self.lastSuccessAt: int = 0
+        self.lastFailureAt: int = 0
+        self.lastError: str = ""
+        self.consecutiveFailures: int = 0
+        self.lastDurationMs: int = 0
+        self.lastCount: int = 0
+        self.successes: int = 0
+        self.failures: int = 0
+        self.lastSuccessAgeSeconds: int = -1
+        self.updatedAt: int = 0
+    }
+
+    static func fromRow(row: dict[str, any]) -> JobStatus {
+        status: JobStatus = JobStatus(JobsRow.str(row, "job"))
+        status.lastSuccessAt = JobsRow.int(row, "last_success_at")
+        status.lastFailureAt = JobsRow.int(row, "last_failure_at")
+        status.lastError = JobsRow.str(row, "last_error")
+        status.consecutiveFailures = JobsRow.int(row, "consecutive_failures")
+        status.lastDurationMs = JobsRow.int(row, "last_duration_ms")
+        status.lastCount = JobsRow.int(row, "last_count")
+        status.successes = JobsRow.int(row, "successes")
+        status.failures = JobsRow.int(row, "failures")
+        status.lastSuccessAgeSeconds = JobsRow.int(row, "success_age")
+        status.updatedAt = JobsRow.int(row, "updated_at")
+        return status
+    }
+
+    #- True when the job last succeeded (no failure since). -#
+    func ok(self) -> bool {
+        return self.consecutiveFailures == 0 and self.lastSuccessAt > 0
+    }
+
+    #- Fewer than ``threshold`` consecutive failures and, when
+       ``maxAgeSeconds`` > 0, a success within that many seconds. -#
+    func healthy(self, threshold: int, maxAgeSeconds: int = 0) -> bool {
+        if self.consecutiveFailures >= threshold {
+            return false
+        }
+        if maxAgeSeconds > 0 and (self.lastSuccessAgeSeconds < 0 or self.lastSuccessAgeSeconds > maxAgeSeconds) {
+            return false
+        }
+        return true
+    }
+
+    func __json__(self) -> json {
+        return {"name": self.name, "lastSuccessAt": self.lastSuccessAt, "lastFailureAt": self.lastFailureAt, "lastError": self.lastError, "consecutiveFailures": self.consecutiveFailures, "lastDurationMs": self.lastDurationMs, "lastCount": self.lastCount, "successes": self.successes, "failures": self.failures, "lastSuccessAgeSeconds": self.lastSuccessAgeSeconds, "updatedAt": self.updatedAt}
+    }
+}
+
+const JobsHealthColumns: str = "job, COALESCE(EXTRACT(EPOCH FROM last_success_at)::bigint, 0) AS last_success_at, COALESCE(EXTRACT(EPOCH FROM last_failure_at)::bigint, 0) AS last_failure_at, last_error, consecutive_failures, last_duration_ms, last_count, successes, failures, COALESCE(EXTRACT(EPOCH FROM now() - last_success_at)::bigint, -1) AS success_age, EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at"
+
+#- Records job outcomes and answers health questions without SQL. The
+   scheduler records every run automatically; call ``success``/``failure``
+   (or ``measure``) for work run elsewhere. -#
+class JobHealth {
+    func init(self, db: Db, prefix: str = JobsDefaultPrefix) {
+        Jobs.requirePrefix(prefix)
+        self.db: Db = db
+        self.prefix: str = prefix
+        self.table: str = prefix + "health"
+    }
+
+    #- Records a success: resets ``consecutiveFailures``. -#
+    func success(self, job: str, durationMs: int = 0, count: int = 0) -> Result[bool] {
+        t: str = self.table
+        _ = self.db.exec(f"INSERT INTO {t} (job, last_success_at, last_duration_ms, last_count, successes, updated_at) VALUES (?, now(), ?, ?, 1, now()) ON CONFLICT (job) DO UPDATE SET last_success_at = now(), consecutive_failures = 0, last_duration_ms = EXCLUDED.last_duration_ms, last_count = EXCLUDED.last_count, successes = {t}.successes + 1, updated_at = now()", [job, durationMs, count])?
+        return Result.Ok(true)
+    }
+
+    #- Records a failure with its error text. -#
+    func failure(self, job: str, error: str, durationMs: int = 0) -> Result[bool] {
+        t: str = self.table
+        text: str = error if error != "" else "failed"
+        _ = self.db.exec(f"INSERT INTO {t} (job, last_failure_at, last_error, consecutive_failures, last_duration_ms, failures, updated_at) VALUES (?, now(), ?, 1, ?, 1, now()) ON CONFLICT (job) DO UPDATE SET last_failure_at = now(), last_error = EXCLUDED.last_error, consecutive_failures = {t}.consecutive_failures + 1, last_duration_ms = EXCLUDED.last_duration_ms, failures = {t}.failures + 1, updated_at = now()", [job, text, durationMs])?
+        return Result.Ok(true)
+    }
+
+    #- ``failure == ""`` records a success, anything else a failure. -#
+    func record(self, job: str, failure: str, durationMs: int = 0, count: int = 0) -> Result[bool] {
+        if failure == "" {
+            return self.success(job, durationMs, count)
+        }
+        return self.failure(job, failure, durationMs)
+    }
+
+    #- Runs ``fn`` and records its outcome, duration and count. Returns
+       ``fn``'s Result; a recording failure does not mask it. An exception
+       is recorded as a failure and re-raised. -#
+    func measure(self, job: str, fn: func() -> Result[int]) -> Result[int] {
+        started: int = Time.nowUnixMilli()
+        outcome: Result[int] = Result.Ok(0)
+        try {
+            outcome = fn()
+        } catch err {
+            _ = self.failure(job, f"exception: {err}", Time.nowUnixMilli() - started)
+            throw err
+        }
+        elapsed: int = Time.nowUnixMilli() - started
+        if outcome.ok() {
+            count: int = outcome.unwrap()
+            _ = self.success(job, elapsed, count)
+        } else {
+            _ = self.failure(job, JobsRow.errText(outcome.error), elapsed)
+        }
+        return outcome
+    }
+
+    #- The status of ``job``; ``JobsNotFound`` when nothing was recorded. -#
+    func get(self, job: str) -> Result[JobStatus] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsHealthColumns} FROM {self.table} WHERE job = ?", [job])?
+        if len(rows) == 0 {
+            return Result.Err(Error("JobsNotFound", f"no health recorded for job {job}"))
+        }
+        return Result.Ok(JobStatus.fromRow(rows[0]))
+    }
+
+    #- Every recorded job, by name. -#
+    func list(self) -> Result[list[JobStatus]] {
+        return self.select("TRUE", [])
+    }
+
+    #- Jobs with at least ``threshold`` consecutive failures. -#
+    func failing(self, threshold: int = 3) -> Result[list[JobStatus]] {
+        return self.select("consecutive_failures >= ?", [threshold])
+    }
+
+    #- Jobs without a success in the last ``maxAgeSeconds`` (or never). -#
+    func stale(self, maxAgeSeconds: int) -> Result[list[JobStatus]] {
+        return self.select("(last_success_at IS NULL OR last_success_at < now() - make_interval(secs => ?))", [maxAgeSeconds])
+    }
+
+    func select(self, condition: str, params: list[any]) -> Result[list[JobStatus]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsHealthColumns} FROM {self.table} WHERE {condition} ORDER BY job", params)?
+        out: list[JobStatus] = []
+        for row in rows {
+            out.append(JobStatus.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Seconds since the least recent last success among jobs that ever
+       succeeded; -1 when none did. A growing value means some job stalled. -#
+    func oldestSuccessAge(self) -> Result[int] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT COALESCE(EXTRACT(EPOCH FROM now() - MIN(last_success_at))::bigint, -1) AS age FROM {self.table}", [])?
+        return Result.Ok(JobsRow.int(rows[0], "age"))
+    }
+
+    #- Gauges for a metrics endpoint: ``jobs_total``, ``jobs_failing``
+       (``threshold`` consecutive failures), ``jobs_oldest_success_age_seconds``
+       and one ``job_<name>_success_age_seconds`` per job (``-`` and ``.``
+       become ``_``; -1 = never). -#
+    func gauges(self, threshold: int = 3) -> Result[dict[str, int]] {
+        jobs: list[JobStatus] = self.list()?
+        out: dict[str, int] = {"jobs_total": len(jobs), "jobs_failing": 0, "jobs_oldest_success_age_seconds": -1}
+        failing: int = 0
+        oldest: int = -1
+        for status in jobs {
+            if status.consecutiveFailures >= threshold {
+                failing += 1
+            }
+            if status.lastSuccessAgeSeconds > oldest {
+                oldest = status.lastSuccessAgeSeconds
+            }
+            key: str = status.name.replace("-", "_").replace(".", "_").replace(":", "_").replace(" ", "_")
+            out["job_" + key + "_success_age_seconds"] = status.lastSuccessAgeSeconds
+        }
+        out["jobs_failing"] = failing
+        out["jobs_oldest_success_age_seconds"] = oldest
+        return Result.Ok(out)
+    }
+
+    #- Deletes the record of ``job`` (renamed or retired jobs). -#
+    func forget(self, job: str) -> Result[bool] {
+        n: int = self.db.exec(f"DELETE FROM {self.table} WHERE job = ?", [job])?
+        return Result.Ok(n > 0)
+    }
+}
+
+func main() {
+    pass
+}

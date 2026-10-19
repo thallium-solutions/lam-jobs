@@ -1,0 +1,142 @@
+# Test: @lam/jobs CronSchedule — 5-field parsing (ranges, steps, lists,
+# names, macros), next run times in UTC across days, months, years and leap
+# days, the Vixie day-of-month/day-of-week OR rule, and parse errors.
+#
+# expect: business: 2026-01-01 09:00 Thu
+# expect: business after friday close: 2026-01-05 09:00 Mon
+# expect: business series: 2026-01-05 09:00 Mon | 2026-01-05 09:15 Mon | 2026-01-05 09:30 Mon
+# expect: leap day: 2028-02-29 00:00 Tue
+# expect: dom or dow: 2026-01-01 04:30 Thu | 2026-01-02 04:30 Fri | 2026-01-09 04:30 Fri | 2026-01-15 04:30 Thu
+# expect: hourly: 2026-03-10 11:00 Tue
+# expect: daily: 2026-03-11 00:00 Wed
+# expect: weekly: 2026-03-15 00:00 Sun
+# expect: monthly: 2026-04-01 00:00 Wed
+# expect: yearly: 2027-01-01 00:00 Fri
+# expect: names: 2026-07-05 12:00 Sun
+# expect: sunday as 7: 2026-03-15 00:00 Sun
+# expect: range step: [5 15 25 35 45 55]
+# expect: start step: [10 30 50]
+# expect: list mix: [0 1 2 3 20 40]
+# expect: new year: 2026-12-31 23:59 Thu | 2027-12-31 23:59 Fri
+# expect: strictly after: 2026-03-10 10:15 Tue
+# expect: matches: true false true
+# expect: expr kept: */15 9-17 * * MON-FRI
+# expect: error fields: CronParseError
+# expect: error minute: CronParseError
+# expect: error hour: CronParseError
+# expect: error step: CronParseError
+# expect: error descending: CronParseError
+# expect: error name: CronParseError
+# expect: error macro: CronParseError
+# expect: error empty item: CronParseError
+# expect: error never: CronParseError
+# expect: valid: true true false
+
+from @lam/jobs import CronSchedule
+from lamerrors import Result
+
+const WeekdayNames: list[str] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+
+func pad(n: int) -> str {
+    if n < 10 {
+        return f"0{n}"
+    }
+    return f"{n}"
+}
+
+func fmt(t: int) -> str {
+    if t < 0 {
+        return "never"
+    }
+    days: int = t // 86400
+    seconds: int = t % 86400
+    date: list[int] = CronSchedule.civilFromDays(days)
+    weekday: int = (days + 4) % 7
+    return f"{date[0]}-{pad(date[1])}-{pad(date[2])} {pad(seconds // 3600)}:{pad(seconds % 3600 // 60)} {WeekdayNames[weekday]}"
+}
+
+func series(times: list[int]) -> str {
+    return " | ".join([fmt(t) for t in times])
+}
+
+func at(year: int, month: int, day: int, hour: int, minute: int) -> int {
+    return CronSchedule.daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60
+}
+
+func minutesOfHour(c: CronSchedule) -> list[int] {
+    out: list[int] = []
+    for t in c.nextN(at(2026, 3, 10, 9, 59), 6) {
+        if t < at(2026, 3, 10, 11, 0) {
+            out.append(t % 3600 // 60)
+        }
+    }
+    return out
+}
+
+func errorKind(expr: str) -> str {
+    r: Result[CronSchedule] = CronSchedule.parse(expr)
+    if r.ok() {
+        return "parsed"
+    }
+    return r.error.kind
+}
+
+func main() {
+    do {
+        business: CronSchedule = CronSchedule.parse("*/15 9-17 * * MON-FRI")?
+        print(f"business: {fmt(business.next(at(2026, 1, 1, 0, 0)))}")
+        print(f"business after friday close: {fmt(business.next(at(2026, 1, 2, 17, 45)))}")
+        print(f"business series: {series(business.nextN(at(2026, 1, 2, 17, 45), 3))}")
+
+        leap: CronSchedule = CronSchedule.parse("0 0 29 2 *")?
+        print(f"leap day: {fmt(leap.next(at(2026, 3, 1, 0, 0)))}")
+
+        either: CronSchedule = CronSchedule.parse("30 4 1,15 * 5")?
+        print(f"dom or dow: {series(either.nextN(at(2026, 1, 1, 0, 0), 4))}")
+
+        base: int = at(2026, 3, 10, 10, 59) + 30
+        hourly: CronSchedule = CronSchedule.parse("@hourly")?
+        print(f"hourly: {fmt(hourly.next(base))}")
+        daily: CronSchedule = CronSchedule.parse("@daily")?
+        print(f"daily: {fmt(daily.next(base))}")
+        weekly: CronSchedule = CronSchedule.parse("@weekly")?
+        print(f"weekly: {fmt(weekly.next(base))}")
+        monthly: CronSchedule = CronSchedule.parse("@monthly")?
+        print(f"monthly: {fmt(monthly.next(base))}")
+        yearly: CronSchedule = CronSchedule.parse("@ANNUALLY")?
+        print(f"yearly: {fmt(yearly.next(base))}")
+
+        names: CronSchedule = CronSchedule.parse("0 12 * jan,Jul sun")?
+        print(f"names: {fmt(names.next(base))}")
+        sunday: CronSchedule = CronSchedule.parse("0 0 * * 7")?
+        print(f"sunday as 7: {fmt(sunday.next(base))}")
+
+        rangeStep: CronSchedule = CronSchedule.parse("5-55/10 * * * *")?
+        print(f"range step: {minutesOfHour(rangeStep)}")
+        startStep: CronSchedule = CronSchedule.parse("10/20 * * * *")?
+        print(f"start step: {minutesOfHour(startStep)}")
+        mix: CronSchedule = CronSchedule.parse("0-3,*/20 * * * *")?
+        print(f"list mix: {minutesOfHour(mix)}")
+
+        newYear: CronSchedule = CronSchedule.parse("59 23 31 12 *")?
+        print(f"new year: {series(newYear.nextN(at(2026, 6, 1, 0, 0), 2))}")
+
+        quarter: CronSchedule = CronSchedule.parse("*/15 * * * *")?
+        print(f"strictly after: {fmt(quarter.next(at(2026, 3, 10, 10, 0)))}")
+        print(f"matches: {business.matches(at(2026, 1, 5, 9, 15) + 59)} {business.matches(at(2026, 1, 5, 9, 16))} {either.matches(at(2026, 1, 9, 4, 30))}")
+        print(f"expr kept: {business}")
+    } catch err {
+        print(f"unexpected cron error: {err}")
+    }
+
+    print(f"error fields: {errorKind('* * * *')}")
+    print(f"error minute: {errorKind('60 * * * *')}")
+    print(f"error hour: {errorKind('* 24 * * *')}")
+    print(f"error step: {errorKind('*/0 * * * *')}")
+    print(f"error descending: {errorKind('5-1 * * * *')}")
+    print(f"error name: {errorKind('* * * FOO *')}")
+    print(f"error macro: {errorKind('@reboot')}")
+    print(f"error empty item: {errorKind('1,,2 * * * *')}")
+    print(f"error never: {errorKind('0 0 30 2 *')}")
+    print(f"valid: {CronSchedule.valid('0 0 * * *')} {CronSchedule.valid('  @midnight  ')} {CronSchedule.valid('')}")
+}

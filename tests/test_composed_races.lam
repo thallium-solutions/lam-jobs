@@ -1,0 +1,267 @@
+# Test: @lam/jobs composed concurrency against a real PostgreSQL — several
+# schedulers racing on the same simulated clock (periodic and cron jobs run
+# exactly once per due time), background schedulers never overlapping a
+# slow run, three worker pools contending for 300 jobs (each executed
+# exactly once), a lease raced by 16 owners, recovery of jobs and scheduled
+# runs abandoned by a crashed instance, and transactional enqueues composed
+# with business writes, rollbacks and workers.
+#
+# requires: database
+# expect: periodic race: runs=20 overlap=false
+# expect: cron race: runs=5
+# expect: background overlap: false runs>=1: true
+# expect: pools: done=300 executed=300 duplicates=0 pools used=3
+# expect: lease race winners: 1
+# expect: crashed claims recovered: done=5 attempts=2
+# expect: crashed schedule: blocked=false then ran=true
+# expect: tx enqueue: committed=20 done=20 rows seen=20
+
+from @lam/jobs import Jobs, JobsRow, JobLeases, JobScheduler, JobQueue, QueuedJob, QueueStats, JobWorkers, CronSchedule
+from lamerrors import Result
+from lamdb import Db, Tx
+from lamenv import Env
+from lamtime import Time
+from lamconcurrency import Atomic, Mutex, WaitGroup
+
+class Probe {
+    func init(self, sleepMs: int) {
+        self.sleepMs: int = sleepMs
+        self.runs: Atomic = Atomic(0)
+        self.active: Atomic = Atomic(0)
+        self.overlap: Atomic = Atomic(0)
+    }
+
+    func hit(self) -> Result[int] {
+        if self.active.increment() > 1 {
+            self.overlap.set(1)
+        }
+        _ = self.runs.increment()
+        Time.sleepMs(self.sleepMs)
+        _ = self.active.decrement()
+        return Result.Ok(1)
+    }
+}
+
+class Ledger {
+    func init(self, db: Db, prefix: str) {
+        self.db: Db = db
+        self.prefix: str = prefix
+        self.mu: Mutex = Mutex()
+        self.seen: dict[int, int] = {}
+        self.owners: dict[str, bool] = {}
+        self.rowsSeen: Atomic = Atomic(0)
+    }
+
+    func record(self, job: QueuedJob) -> Result[bool] {
+        Time.sleepMs(2)
+        self.mu.lock()
+        count: int = 0
+        if job.id in self.seen {
+            count = self.seen[job.id]
+        }
+        self.seen[job.id] = count + 1
+        self.owners[job.lockedBy] = true
+        self.mu.unlock()
+        return Result.Ok(true)
+    }
+
+    func checkRow(self, job: QueuedJob) -> Result[bool] {
+        ref: int = job.payload.order
+        rows: list[dict[str, any]] = self.db.query(f"SELECT id FROM {self.prefix}orders WHERE id = ?", [ref])?
+        if len(rows) == 1 {
+            _ = self.rowsSeen.increment()
+        }
+        return Result.Ok(true)
+    }
+}
+
+async func tickAsync(s: JobScheduler, now: int, group: WaitGroup) {
+    r: Result[dict[str, int]] = s.tick(now)
+    if not r.ok() {
+        print(f"tick failed: {r.error}")
+    }
+    group.done()
+}
+
+async func acquireAsync(db: Db, prefix: str, owner: str, wins: Atomic, group: WaitGroup) {
+    leases: JobLeases = JobLeases(db, owner, prefix)
+    r: Result[bool] = leases.acquire("leader", 30)
+    if r.ok() and r.unwrap() {
+        _ = wins.increment()
+    }
+    group.done()
+}
+
+async func orderAsync(db: Db, q: JobQueue, prefix: str, index: int, committed: Atomic, group: WaitGroup) {
+    do {
+        tx: Tx = db.begin()?
+        rows: list[dict[str, any]] = tx.query(f"INSERT INTO {prefix}orders (note) VALUES (?) RETURNING id", [f"order {index}"])?
+        id: int = JobsRow.int(rows[0], "id")
+        _ = q.enqueueIn(tx, {"order": id})?
+        if index % 2 == 0 {
+            _ = tx.commit()?
+            _ = committed.increment()
+        } else {
+            _ = tx.rollback()?
+        }
+    } catch err {
+        print(f"order {index} failed: {err}")
+    }
+    group.done()
+}
+
+func waitStats(q: JobQueue, done: int, ms: int) -> Result[QueueStats] {
+    waited: int = 0
+    s: QueueStats = q.stats()?
+    while s.done < done and waited < ms {
+        Time.sleepMs(50)
+        waited += 50
+        s = q.stats()?
+    }
+    return Result.Ok(s)
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        _ = db.setPool(60, 20, 60, 600)?
+        prefix: str = "lam_jobs_race_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+
+        # 1. Four schedulers tick the same simulated seconds concurrently.
+        periodic: Probe = Probe(30)
+        minute: Probe = Probe(0)
+        schedulers: list[JobScheduler] = []
+        for i in range(4) {
+            s: JobScheduler = JobScheduler(db, f"s{i}", prefix).quiet()
+            s.every("race", 1, periodic.hit, 3)
+            s.cron("minute", "* * * * *", minute.hit, 3)
+            schedulers.append(s)
+        }
+        t0: int = CronSchedule.daysFromCivil(2027, 3, 1) * 86400
+        _ = schedulers[0].register(t0)?
+        for step in range(20) {
+            group: WaitGroup = WaitGroup()
+            for s in schedulers {
+                group.add(1)
+                _ = tickAsync(s, t0 + step, group)
+            }
+            group.wait()
+        }
+        print(f"periodic race: runs={periodic.runs.get()} overlap={periodic.overlap.get() == 1}")
+        for k in range(1, 6) {
+            group: WaitGroup = WaitGroup()
+            for s in schedulers {
+                group.add(1)
+                _ = tickAsync(s, t0 + k * 60, group)
+            }
+            group.wait()
+        }
+        print(f"cron race: runs={minute.runs.get()}")
+
+        # 2. Background schedulers: a 1.5 s job due every second never overlaps.
+        slow: Probe = Probe(1500)
+        bgA: JobScheduler = JobScheduler(db, "bg-a", prefix).quiet().withPollInterval(50)
+        bgB: JobScheduler = JobScheduler(db, "bg-b", prefix).quiet().withPollInterval(50)
+        bgA.every("slow", 1, slow.hit, 3)
+        bgB.every("slow", 1, slow.hit, 3)
+        bgA.start()
+        bgB.start()
+        Time.sleepMs(3500)
+        bgA.stop()
+        bgB.stop()
+        print(f"background overlap: {slow.overlap.get() == 1} runs>=1: {slow.runs.get() >= 1}")
+
+        # 3. Three pools with separate owners contend for 300 jobs.
+        ledger: Ledger = Ledger(db, prefix)
+        producer: JobQueue = JobQueue(db, "contended", "producer", prefix).withNotify(false)
+        for i in range(300) {
+            _ = producer.enqueue({"i": i})?
+        }
+        pools: list[JobWorkers] = []
+        for i in range(3) {
+            q: JobQueue = JobQueue(db, "contended", f"pool{i}", prefix)
+            pools.append(JobWorkers(q, ledger.record, 4).withPollInterval(50).quiet())
+        }
+        for p in pools {
+            p.start()
+        }
+        contended: QueueStats = waitStats(producer, 300, 60000)?
+        for p in pools {
+            _ = p.stop()
+        }
+        duplicates: int = 0
+        for id in ledger.seen {
+            if ledger.seen[id] != 1 {
+                duplicates += 1
+            }
+        }
+        print(f"pools: done={contended.done} executed={len(ledger.seen)} duplicates={duplicates} pools used={len(ledger.owners)}")
+
+        # 4. Sixteen owners race for one lease.
+        wins: Atomic = Atomic(0)
+        group: WaitGroup = WaitGroup()
+        for i in range(16) {
+            group.add(1)
+            _ = acquireAsync(db, prefix, f"owner{i}", wins, group)
+        }
+        group.wait()
+        print(f"lease race winners: {wins.get()}")
+
+        # 5. A worker claims jobs and dies; another pool finishes them after the lease.
+        crashedQueue: JobQueue = JobQueue(db, "crash", "dead-worker", prefix)
+        for i in range(5) {
+            _ = crashedQueue.enqueue({"i": i})?
+        }
+        abandoned: list[QueuedJob] = crashedQueue.claim(5, 1)?
+        rescueQueue: JobQueue = JobQueue(db, "crash", "rescuer", prefix)
+        rescuer: JobWorkers = JobWorkers(rescueQueue, ledger.record, 2).withPollInterval(100).quiet()
+        rescuer.start()
+        rescued: QueueStats = waitStats(rescueQueue, 5, 10000)?
+        _ = rescuer.stop()
+        attempts: list[QueuedJob] = rescueQueue.list("done")?
+        maxAttempt: int = 0
+        for j in attempts {
+            if j.attempt > maxAttempt {
+                maxAttempt = j.attempt
+            }
+        }
+        print(f"crashed claims recovered: done={rescued.done} attempts={maxAttempt} {'' if len(abandoned) == 5 else 'claim failed'}".trim())
+
+        # 6. A scheduler takes a run and dies; another runs it after the lock expires.
+        crashProbe: Probe = Probe(0)
+        dying: JobScheduler = JobScheduler(db, "dying", prefix).quiet()
+        dying.every("nightly", 3600, crashProbe.hit, 3)
+        survivor: JobScheduler = JobScheduler(db, "survivor", prefix).quiet()
+        survivor.every("nightly", 3600, crashProbe.hit, 3)
+        tc: int = t0 + 100000
+        _ = dying.register(tc)?
+        _ = dying.claim(dying.jobs[0], tc, false)?
+        blocked: dict[str, int] = survivor.tick(tc + 3600)?
+        Time.sleepMs(3300)
+        ran: dict[str, int] = survivor.tick(tc + 3600)?
+        print(f"crashed schedule: blocked={'nightly' in blocked} then ran={'nightly' in ran}")
+
+        # 7. Enqueue inside business transactions; half roll back.
+        _ = db.exec(f"DROP TABLE IF EXISTS {prefix}orders", [])?
+        _ = db.exec(f"CREATE TABLE {prefix}orders (id SERIAL PRIMARY KEY, note TEXT NOT NULL)", [])?
+        orders: JobQueue = JobQueue(db, "orders", "orders", prefix)
+        committed: Atomic = Atomic(0)
+        group = WaitGroup()
+        for i in range(40) {
+            group.add(1)
+            _ = orderAsync(db, orders, prefix, i, committed, group)
+        }
+        group.wait()
+        orderWorkers: JobWorkers = JobWorkers(orders, ledger.checkRow, 4).withPollInterval(50).quiet()
+        orderWorkers.start()
+        orderStats: QueueStats = waitStats(orders, committed.get(), 15000)?
+        _ = orderWorkers.stop()
+        print(f"tx enqueue: committed={committed.get()} done={orderStats.done} rows seen={ledger.rowsSeen.get()}")
+        _ = db.exec(f"DROP TABLE {prefix}orders", [])?
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

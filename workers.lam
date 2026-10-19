@@ -1,0 +1,317 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — a worker pool for a ``JobQueue``: ``concurrency`` loops claim
+# jobs, run the handler with an optional per-job timeout while renewing the
+# claim, then complete, retry or bury the job. Idle loops wait for a
+# wake-up (enqueue in this process, or LISTEN/NOTIFY after ``listen``) or
+# the poll interval. ``stop()`` stops claiming and drains running jobs.
+
+from lamerrors import Result, Error
+from lamconcurrency import Channel, Atomic, WaitGroup
+from lamlog import Log
+from .schema import JobsRow
+from .keeper import JobsKeeper, JobsSignal
+from .notify import JobsListener
+from .queue import JobQueue, QueuedJob, JobsPermanentError
+
+#- Runs ``handler`` for the jobs of ``queue``. The handler returns
+   ``Ok(_)`` to complete the job, an error to retry it with backoff (dead
+   letter after the last attempt), or ``JobQueue.permanent(message)`` to
+   bury it at once. An exception counts as a retryable failure. -#
+class JobWorkers {
+    func init(self, queue: JobQueue, handler: func(QueuedJob) -> Result[bool], concurrency: int = 4) {
+        if concurrency < 1 {
+            throw ValueError("@lam/jobs: concurrency must be at least 1")
+        }
+        self.queue: JobQueue = queue
+        self.handler: func(QueuedJob) -> Result[bool] = handler
+        self.concurrency: int = concurrency
+        self.leaseSeconds: int = 60
+        self.timeoutSeconds: int = 0
+        self.pollMs: int = 1000
+        self.drainSeconds: int = 30
+        self.logFailures: bool = true
+        self.listener: JobsListener = None
+        self.started: Atomic = Atomic(0)
+        self.stopping: Atomic = Atomic(0)
+        self.loops: Atomic = Atomic(0)
+        self.active: Atomic = Atomic(0)
+        self.completed: Atomic = Atomic(0)
+        self.failures: Atomic = Atomic(0)
+        self.stopped: JobsSignal = JobsSignal()
+    }
+
+    #- Claim lease (default 60 s), renewed every third of it while the
+       handler runs; a crashed worker's jobs are retried after it expires. -#
+    func withLease(self, seconds: int) -> JobWorkers {
+        if seconds < 3 {
+            throw ValueError("@lam/jobs: leaseSeconds must be at least 3")
+        }
+        self.leaseSeconds = seconds
+        return self
+    }
+
+    #- Per-job timeout (0 = none): a job still running after ``seconds``
+       is failed and retried. Go cannot kill the handler, which keeps
+       running in the background: make handlers honour their own deadlines
+       and keep jobs idempotent. -#
+    func withTimeout(self, seconds: int) -> JobWorkers {
+        self.timeoutSeconds = seconds if seconds > 0 else 0
+        return self
+    }
+
+    #- How long an idle loop waits before polling again (default 1000 ms). -#
+    func withPollInterval(self, ms: int) -> JobWorkers {
+        self.pollMs = ms if ms > 10 else 10
+        return self
+    }
+
+    #- How long ``stop()`` waits for running jobs (default 30 s). -#
+    func withDrainTimeout(self, seconds: int) -> JobWorkers {
+        self.drainSeconds = seconds if seconds > 0 else 0
+        return self
+    }
+
+    #- Do not log failed attempts (``lamlog`` warnings). -#
+    func quiet(self) -> JobWorkers {
+        self.logFailures = false
+        return self
+    }
+
+    #- Wakes idle loops through PostgreSQL LISTEN/NOTIFY as soon as a job
+       is enqueued by any process (``databaseUrl`` defaults to the queue's
+       ``Db`` connection string). Polling continues as a fallback. -#
+    func listen(self, databaseUrl: str = "") -> Result[bool] {
+        url: str = databaseUrl if databaseUrl != "" else self.queue.db.dsn
+        listener: JobsListener = JobsListener.open(url, self.queue.channel, [self.queue.name], self.queue.wake)?
+        if self.listener != None {
+            self.listener.close()
+        }
+        self.listener = listener
+        return Result.Ok(true)
+    }
+
+    #- Wake-ups delivered by LISTEN/NOTIFY so far (0 without ``listen``). -#
+    func notifications(self) -> int {
+        if self.listener == None {
+            return 0
+        }
+        return self.listener.wakeups()
+    }
+
+    func completedCount(self) -> int {
+        return self.completed.get()
+    }
+
+    func failedCount(self) -> int {
+        return self.failures.get()
+    }
+
+    func activeCount(self) -> int {
+        return self.active.get()
+    }
+
+    func isStopping(self) -> bool {
+        return self.stopping.get() == 1
+    }
+
+    # ── one job ───────────────────────────────────────────────────────
+
+    func extendQuietly(self, job: QueuedJob) -> bool {
+        r: Result[bool] = self.queue.extend(job, self.leaseSeconds)
+        if not r.ok() {
+            return true
+        }
+        return r.unwrap()
+    }
+
+    func callHandler(self, job: QueuedJob) -> Result[bool] {
+        outcome: Result[bool] = Result.Ok(true)
+        try {
+            outcome = self.handler(job)
+        } catch err {
+            outcome = Result.Err(Error("JobsHandlerException", f"{err}"))
+        }
+        return outcome
+    }
+
+    async func callAsync(self, job: QueuedJob, box: Channel) {
+        outcome: Result[bool] = self.callHandler(job)
+        _ = box.offer(outcome)
+    }
+
+    func invoke(self, job: QueuedJob) -> Result[bool] {
+        if self.timeoutSeconds <= 0 {
+            return self.callHandler(job)
+        }
+        box: Channel = Channel(1)
+        _ = self.callAsync(job, box)
+        received: Result[any] = box.receiveTimeout(self.timeoutSeconds * 1000)
+        if not received.ok() {
+            return Result.Err(Error("JobsTimeout", f"job timed out after {self.timeoutSeconds} s"))
+        }
+        outcome: Result[bool] = received.unwrap()
+        return outcome
+    }
+
+    #- Runs one claimed job to its outcome; returns true when completed. -#
+    func process(self, job: QueuedJob) -> bool {
+        _ = self.active.increment()
+        workers: JobWorkers = self
+        keeper: JobsKeeper = JobsKeeper(self.leaseSeconds * 1000 // 3, lambda() -> bool: workers.extendQuietly(job))
+        keeper.start()
+        outcome: Result[bool] = self.invoke(job)
+        keeper.stop()
+        done: bool = false
+        if outcome.ok() {
+            r: Result[bool] = self.queue.complete(job)
+            if not r.ok() {
+                Log.warn(f"@lam/jobs queue {self.queue.name}: completing job {job.id}: {JobsRow.errText(r.error)}")
+            } elif not r.unwrap() {
+                Log.warn(f"@lam/jobs queue {self.queue.name}: job {job.id} finished after its claim expired")
+            } else {
+                done = true
+                _ = self.completed.increment()
+            }
+        } else {
+            _ = self.failures.increment()
+            problem: str = JobsRow.errText(outcome.error)
+            settled: Result[str] = Result.Ok("")
+            if JobsRow.errKind(outcome.error) == JobsPermanentError {
+                settled = self.queue.bury(job, problem)
+            } else {
+                settled = self.queue.fail(job, problem)
+            }
+            if not settled.ok() {
+                Log.warn(f"@lam/jobs queue {self.queue.name}: recording failure of job {job.id}: {JobsRow.errText(settled.error)}")
+            } elif self.logFailures {
+                state: str = settled.unwrap()
+                Log.warn(f"@lam/jobs queue {self.queue.name}: job {job.id} attempt {job.attempt}/{job.maxAttempts} failed ({state}): {problem}")
+            }
+        }
+        _ = self.active.decrement()
+        return done
+    }
+
+    async func processAsync(self, job: QueuedJob, group: WaitGroup) {
+        try {
+            _ = self.process(job)
+        } catch err {
+            Log.error(f"@lam/jobs queue {self.queue.name}: job {job.id}: {err}")
+        }
+        group.done()
+    }
+
+    # ── synchronous runs (tests, CLI) ─────────────────────────────────
+
+    #- Claims up to ``concurrency`` due jobs, runs them concurrently and
+       waits; returns how many were claimed. -#
+    func runOnce(self) -> Result[int] {
+        jobs: list[QueuedJob] = self.queue.claim(self.concurrency, self.leaseSeconds)?
+        group: WaitGroup = WaitGroup()
+        for job in jobs {
+            group.add(1)
+            _ = self.processAsync(job, group)
+        }
+        group.wait()
+        return Result.Ok(len(jobs))
+    }
+
+    #- ``runOnce`` until no job is due (or ``maxRounds`` rounds, 0 = no
+       limit); returns how many jobs ran. -#
+    func drain(self, maxRounds: int = 0) -> Result[int] {
+        total: int = 0
+        rounds: int = 0
+        while maxRounds <= 0 or rounds < maxRounds {
+            n: int = self.runOnce()?
+            rounds += 1
+            if n == 0 {
+                break
+            }
+            total += n
+        }
+        return Result.Ok(total)
+    }
+
+    # ── background pool ───────────────────────────────────────────────
+
+    #- Claims and runs one job; false when none was due (or the claim
+       failed). -#
+    func step(self) -> bool {
+        claimed: Result[list[QueuedJob]] = self.queue.claim(1, self.leaseSeconds)
+        if not claimed.ok() {
+            Log.warn(f"@lam/jobs queue {self.queue.name}: claim: {JobsRow.errText(claimed.error)}")
+            return false
+        }
+        jobs: list[QueuedJob] = claimed.unwrap()
+        for job in jobs {
+            _ = self.process(job)
+        }
+        return len(jobs) > 0
+    }
+
+    async func loop(self) {
+        while self.stopping.get() == 0 {
+            busy: bool = false
+            try {
+                busy = self.step()
+            } catch err {
+                # Never lose a loop to an unexpected panic: an unfinished job
+                # is retried when its lease expires.
+                Log.error(f"@lam/jobs queue {self.queue.name}: worker loop: {err}")
+            }
+            if not busy {
+                _ = self.queue.wake.wait(self.pollMs)
+            }
+        }
+        _ = self.loops.decrement()
+    }
+
+    #- Starts ``concurrency`` background loops (idempotent). -#
+    func start(self) {
+        if not self.started.compareAndSwap(0, 1) {
+            return
+        }
+        for i in range(self.concurrency) {
+            _ = self.loops.increment()
+            _ = self.loop()
+        }
+    }
+
+    #- ``start()`` and block until ``stop()`` is called elsewhere. -#
+    func run(self) {
+        self.start()
+        while self.stopped.sleep(60000) {
+            pass
+        }
+    }
+
+    #- Stops claiming and waits up to the drain timeout for running jobs.
+       True when every loop finished; jobs still running after the timeout
+       keep their claims until the lease expires and are then retried. -#
+    func stop(self) -> bool {
+        self.stopping.set(1)
+        self.queue.wake.wake()
+        waited: int = 0
+        limit: int = self.drainSeconds * 1000
+        while self.loops.get() > 0 or self.active.get() > 0 {
+            if waited >= limit {
+                break
+            }
+            self.queue.wake.wake()
+            _ = self.stopped.sleep(10)
+            waited += 10
+        }
+        if self.listener != None {
+            self.listener.close()
+        }
+        drained: bool = self.loops.get() == 0 and self.active.get() == 0
+        self.stopped.fire()
+        return drained
+    }
+}
+
+func main() {
+    pass
+}

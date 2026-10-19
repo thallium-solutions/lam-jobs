@@ -1,0 +1,117 @@
+# Test: @lam/jobs JobLeases — acquire, re-acquire by the holder, refusal
+# for others, holder/info/list, renew, release, fencing tokens, expiry
+# takeover, prune, and runExclusive (renewal while running, release after,
+# error propagation, refusal while held).
+#
+# requires: database
+# expect: a acquires: true
+# expect: b refused: false
+# expect: a re-acquires: true fence 1
+# expect: holder: a
+# expect: holds: true false
+# expect: info: held=true remaining ok=true
+# expect: b renew refused: false
+# expect: a renew: true
+# expect: b release refused: false
+# expect: a release: true holder after: ''
+# expect: b acquires free lease: true fence 2
+# expect: expiry: b holds=false a takes over=true fence 3
+# expect: list: free::false,x:a:true
+# expect: pruned: 1
+# expect: bad ttl: JobsConfigError
+# expect: exclusive ran: true runs 1
+# expect: lease renewed while running: true
+# expect: released after run: true
+# expect: exclusive refused while held: false runs 1
+# expect: exclusive error: JobFailed
+# expect: released after error: ''
+
+from @lam/jobs import Jobs, JobLeases, JobLease
+from lamerrors import Result, Error
+from lamdb import Db
+from lamenv import Env
+from lamtime import Time
+from lamconcurrency import Atomic
+
+class SlowTask {
+    func init(self, leases: JobLeases, observer: JobLeases) {
+        self.leases: JobLeases = leases
+        self.observer: JobLeases = observer
+        self.runs: Atomic = Atomic(0)
+        self.heldMidway: bool = false
+    }
+
+    func run(self) -> Result[int] {
+        _ = self.runs.increment()
+        # Longer than the 3 s TTL: only renewal keeps the lease.
+        Time.sleepMs(4000)
+        holder: str = self.observer.holder("slow")?
+        self.heldMidway = holder == self.leases.owner
+        return Result.Ok(1)
+    }
+}
+
+func failing() -> Result[int] {
+    return Result.Err(Error("JobFailed", "boom"))
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_lease_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        a: JobLeases = JobLeases(db, "a", prefix)
+        b: JobLeases = JobLeases(db, "b", prefix)
+
+        print(f"a acquires: {a.acquire('x', 30)?}")
+        print(f"b refused: {b.acquire('x', 30)?}")
+        again: bool = a.acquire("x", 30)?
+        info: JobLease = a.info("x")?
+        print(f"a re-acquires: {again} fence {info.fence}")
+        print(f"holder: {b.holder('x')?}")
+        print(f"holds: {a.holds('x')?} {b.holds('x')?}")
+        print(f"info: held={info.held} remaining ok={info.remainingSeconds > 25 and info.remainingSeconds <= 30}")
+        print(f"b renew refused: {b.renew('x', 60)?}")
+        print(f"a renew: {a.renew('x', 60)?}")
+        print(f"b release refused: {b.release('x')?}")
+        released: bool = a.release("x")?
+        holderAfter: str = a.holder("x")?
+        print(f"a release: {released} holder after: '{holderAfter}'")
+        took: bool = b.acquire("x", 1)?
+        tookInfo: JobLease = b.info("x")?
+        print(f"b acquires free lease: {took} fence {tookInfo.fence}")
+        Time.sleepMs(1300)
+        stillB: bool = b.holds("x")?
+        takeover: bool = a.acquire("x", 30)?
+        takeoverInfo: JobLease = a.info("x")?
+        print(f"expiry: b holds={stillB} a takes over={takeover} fence {takeoverInfo.fence}")
+
+        _ = a.acquire("free", 1)?
+        Time.sleepMs(1300)
+        listed: list[JobLease] = a.list()?
+        parts: list[str] = [f"{l.name}:{l.owner}:{l.held}" for l in listed]
+        print(f"list: {','.join(parts)}")
+        print(f"pruned: {a.prune(0)?}")
+        bad: Result[bool] = a.acquire("y", 0)
+        print(f"bad ttl: {bad.error.kind}")
+
+        task: SlowTask = SlowTask(a, b)
+        ran: bool = a.runExclusive("slow", 3, task.run)?
+        print(f"exclusive ran: {ran} runs {task.runs.get()}")
+        print(f"lease renewed while running: {task.heldMidway}")
+        releasedSlow: str = b.holder("slow")?
+        print(f"released after run: {releasedSlow == ''}")
+        _ = b.acquire("slow", 30)?
+        refused: bool = a.runExclusive("slow", 3, task.run)?
+        print(f"exclusive refused while held: {refused} runs {task.runs.get()}")
+        _ = b.release("slow")?
+        failed: Result[bool] = a.runExclusive("slow", 3, failing)
+        print(f"exclusive error: {failed.error.kind}")
+        afterError: str = b.holder("slow")?
+        print(f"released after error: '{afterError}'")
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

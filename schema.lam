@@ -1,0 +1,351 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — schema management, shared helpers and the ``JobsSql``
+# interface. Every table lives under a configurable prefix (default
+# ``lam_jobs_``); ``Jobs.migrate`` creates and upgrades them idempotently and
+# is safe to run concurrently from several instances (a transaction-scoped
+# PostgreSQL advisory lock serialises the migrators).
+
+from lamdb import Db, Tx
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "crypto/rand"
+        "encoding/hex"
+        "fmt"
+        "math/big"
+        "os"
+        "regexp"
+        "strconv"
+        "strings"
+        "time"
+    )
+
+    var jobsPrefixPattern = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,39}$`)
+
+    func jobsAnyInt(value interface{}) int {
+        switch typed := value.(type) {
+        case nil:
+            return 0
+        case int:
+            return typed
+        case int64:
+            return int(typed)
+        case int32:
+            return int(typed)
+        case float64:
+            return int(typed)
+        case float32:
+            return int(typed)
+        case bool:
+            if typed {
+                return 1
+            }
+            return 0
+        case []byte:
+            n, _ := strconv.ParseInt(strings.TrimSpace(string(typed)), 10, 64)
+            return int(n)
+        case string:
+            text := strings.TrimSpace(typed)
+            n, err := strconv.ParseInt(text, 10, 64)
+            if err != nil {
+                if f, ferr := strconv.ParseFloat(text, 64); ferr == nil {
+                    return int(f)
+                }
+            }
+            return int(n)
+        case time.Time:
+            return int(typed.Unix())
+        case *big.Int:
+            return int(typed.Int64())
+        }
+        return 0
+    }
+
+    func jobsAnyStr(value interface{}) string {
+        switch typed := value.(type) {
+        case nil:
+            return ""
+        case string:
+            return typed
+        case []byte:
+            return string(typed)
+        case time.Time:
+            return typed.UTC().Format(time.RFC3339)
+        }
+        return fmt.Sprintf("%v", value)
+    }
+
+    func jobsAnyBool(value interface{}) bool {
+        switch typed := value.(type) {
+        case bool:
+            return typed
+        case int64:
+            return typed != 0
+        case int:
+            return typed != 0
+        case string:
+            return typed == "t" || typed == "true" || typed == "1"
+        case []byte:
+            text := string(typed)
+            return text == "t" || text == "true" || text == "1"
+        }
+        return false
+    }
+
+    func jobsNewOwner() string {
+        host, err := os.Hostname()
+        if err != nil || host == "" {
+            host = "unknown"
+        }
+        buf := make([]byte, 6)
+        if _, err := rand.Read(buf); err != nil {
+            return fmt.Sprintf("%s:%d:%d", host, os.Getpid(), time.Now().UnixNano())
+        }
+        return fmt.Sprintf("%s:%d:%s", host, os.Getpid(), hex.EncodeToString(buf))
+    }
+
+    func jobsHostname() string {
+        host, err := os.Hostname()
+        if err != nil {
+            return ""
+        }
+        return host
+    }
+}
+
+#- Default table prefix: ``lam_jobs_leases``, ``lam_jobs_queue``, ... -#
+const JobsDefaultPrefix: str = "lam_jobs_"
+
+#- Schema version created by this release of the library. -#
+const JobsSchemaVersion: int = 1
+
+#- Both ``lamdb.Db`` and ``lamdb.Tx`` satisfy this interface, so
+   ``JobQueue.enqueueIn``/``completeIn`` can write inside the caller's
+   transaction. Calls through the interface always pass ``params``
+   (lamc 2.1 does not fill interface default arguments). -#
+interface JobsSql {
+    func exec(query: str, params: list[any] = []) -> Result[int]
+    func query(query: str, params: list[any] = []) -> Result[list[dict[str, any]]]
+}
+
+#- Typed reads of ``lamdb`` row values (``int64``, ``time.Time``, ``[]byte``,
+   ``nil``) without per-call type assertions. -#
+class JobsRow {
+    static func int(row: dict[str, any], key: str) -> int {
+        value: any = None
+        if key in row {
+            value = row[key]
+        }
+        out: int = 0
+        go! {
+            out = jobsAnyInt(value)
+        }
+        return out
+    }
+
+    static func str(row: dict[str, any], key: str) -> str {
+        value: any = None
+        if key in row {
+            value = row[key]
+        }
+        out: str = ""
+        go! {
+            out = jobsAnyStr(value)
+        }
+        return out
+    }
+
+    static func bool(row: dict[str, any], key: str) -> bool {
+        value: any = None
+        if key in row {
+            value = row[key]
+        }
+        out: bool = false
+        go! {
+            out = jobsAnyBool(value)
+        }
+        return out
+    }
+
+    #- Text of a Result error (``Error.message`` when present). -#
+    static func errText(err: any) -> str {
+        out: str = ""
+        go! {
+            switch typed := err.(type) {
+            case nil:
+                out = ""
+            case *Error:
+                if typed.Kind != "" && typed.Message == "" {
+                    out = typed.Kind
+                } else {
+                    out = typed.Message
+                }
+            case error:
+                out = typed.Error()
+            default:
+                out = jobsAnyStr(err)
+            }
+        }
+        return out
+    }
+
+    #- Error kind of a Result error ("" for non-``Error`` values). -#
+    static func errKind(err: any) -> str {
+        out: str = ""
+        go! {
+            if typed, ok := err.(*Error); ok && typed != nil {
+                out = typed.Kind
+            }
+        }
+        return out
+    }
+}
+
+#- Schema management and library-wide helpers. -#
+class Jobs {
+    #- True when ``prefix`` is a safe SQL identifier prefix: lower-case
+       letters, digits and ``_``, starting with a letter or ``_``, at most 40
+       characters. -#
+    static func checkPrefix(prefix: str) -> bool {
+        ok: bool = false
+        go! {
+            ok = jobsPrefixPattern.MatchString(prefix)
+        }
+        return ok
+    }
+
+    #- Throws ``ValueError`` for an unsafe prefix (a programming error: the
+       prefix is interpolated into SQL). -#
+    static func requirePrefix(prefix: str) {
+        if not Jobs.checkPrefix(prefix) {
+            throw ValueError(f"@lam/jobs: invalid table prefix {prefix}: use lower-case letters, digits and _ (max 40)")
+        }
+    }
+
+    #- A unique owner id for leases, schedules and queue claims:
+       ``host:pid:random``. -#
+    static func newOwner() -> str {
+        out: str = ""
+        go! {
+            out = jobsNewOwner()
+        }
+        return out
+    }
+
+    static func hostname() -> str {
+        out: str = ""
+        go! {
+            out = jobsHostname()
+        }
+        return out
+    }
+
+    #- The LISTEN/NOTIFY channel used by queues under ``prefix``. -#
+    static func notifyChannel(prefix: str) -> str {
+        return prefix + "queue"
+    }
+
+    #- The DDL of every schema version, in order: element ``i`` upgrades the
+       schema from version ``i`` to ``i + 1``. -#
+    static func migrations(prefix: str) -> list[list[str]] {
+        p: str = prefix
+        v1: list[str] = [
+            f"CREATE TABLE IF NOT EXISTS {p}leases (name TEXT PRIMARY KEY, owner TEXT NOT NULL, fence BIGINT NOT NULL DEFAULT 1, acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at TIMESTAMPTZ NOT NULL)",
+            f"CREATE TABLE IF NOT EXISTS {p}schedules (name TEXT PRIMARY KEY, spec TEXT NOT NULL, next_run_at TIMESTAMPTZ NOT NULL, paused BOOLEAN NOT NULL DEFAULT FALSE, running_owner TEXT, running_until TIMESTAMPTZ, last_owner TEXT NOT NULL DEFAULT '', last_started_at TIMESTAMPTZ, last_finished_at TIMESTAMPTZ, runs BIGINT NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+            f"CREATE TABLE IF NOT EXISTS {p}health (job TEXT PRIMARY KEY, last_success_at TIMESTAMPTZ, last_failure_at TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '', consecutive_failures INT NOT NULL DEFAULT 0, last_duration_ms BIGINT NOT NULL DEFAULT 0, last_count BIGINT NOT NULL DEFAULT 0, successes BIGINT NOT NULL DEFAULT 0, failures BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+            f"CREATE TABLE IF NOT EXISTS {p}instances (component TEXT NOT NULL, instance TEXT NOT NULL, version TEXT NOT NULL DEFAULT '', host TEXT NOT NULL DEFAULT '', started_at TIMESTAMPTZ NOT NULL DEFAULT now(), seen_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (component, instance))",
+            f"CREATE TABLE IF NOT EXISTS {p}queue (id BIGSERIAL PRIMARY KEY, queue TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'running', 'done', 'dead', 'cancelled')), payload JSONB NOT NULL, priority INT NOT NULL DEFAULT 0, unique_key TEXT, attempts INT NOT NULL DEFAULT 0, max_attempts INT NOT NULL DEFAULT 10, run_at TIMESTAMPTZ NOT NULL DEFAULT now(), locked_by TEXT, locked_until TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ)",
+            f"CREATE INDEX IF NOT EXISTS {p}queue_due ON {p}queue (queue, priority DESC, run_at, id) WHERE state = 'pending'",
+            f"CREATE INDEX IF NOT EXISTS {p}queue_running ON {p}queue (queue, locked_until) WHERE state = 'running'",
+            f"CREATE INDEX IF NOT EXISTS {p}queue_finished ON {p}queue (queue, finished_at) WHERE state IN ('done', 'dead', 'cancelled')",
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {p}queue_unique ON {p}queue (queue, unique_key) WHERE unique_key IS NOT NULL AND state IN ('pending', 'running')"
+        ]
+        out: list[list[str]] = [v1]
+        return out
+    }
+
+    #- Creates or upgrades the library tables under ``prefix``. Returns how
+       many schema versions were applied (0 when already current). Safe to
+       call at every start from every instance: migrators take a
+       transaction-scoped advisory lock, and each version is recorded in
+       ``<prefix>schema_version``. -#
+    static func migrate(db: Db, prefix: str = JobsDefaultPrefix) -> Result[int] {
+        if not Jobs.checkPrefix(prefix) {
+            return Result.Err(Error("JobsConfigError", f"invalid table prefix {prefix}"))
+        }
+        if db.driverName() != "postgres" {
+            return Result.Err(Error("JobsConfigError", f"@lam/jobs requires PostgreSQL (driver {db.driverName()})"))
+        }
+        steps: list[list[str]] = Jobs.migrations(prefix)
+        tx: Tx = db.begin()?
+        applied: int = 0
+        do {
+            _ = tx.exec("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", [prefix + "migrate"])?
+            _ = tx.exec(f"CREATE TABLE IF NOT EXISTS {prefix}schema_version (version INT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())", [])?
+            rows: list[dict[str, any]] = tx.query(f"SELECT COALESCE(MAX(version), 0)::bigint AS version FROM {prefix}schema_version", [])?
+            current: int = JobsRow.int(rows[0], "version")
+            version: int = 0
+            for step in steps {
+                version += 1
+                if version <= current {
+                    continue
+                }
+                for statement in step {
+                    _ = tx.exec(statement, [])?
+                }
+                _ = tx.exec(f"INSERT INTO {prefix}schema_version (version) VALUES (?)", [version])?
+                applied += 1
+            }
+            _ = tx.commit()?
+        } catch err {
+            _ = tx.rollback()
+            return Result.Err(Error("JobsMigrationError", JobsRow.errText(err), err))
+        }
+        return Result.Ok(applied)
+    }
+
+    #- ``migrate`` for callers that only need success: ``Ok(true)``. -#
+    static func ensureSchema(db: Db, prefix: str = JobsDefaultPrefix) -> Result[bool] {
+        _ = Jobs.migrate(db, prefix)?
+        return Result.Ok(true)
+    }
+
+    #- The installed schema version (0 when not installed). -#
+    static func schemaVersion(db: Db, prefix: str = JobsDefaultPrefix) -> Result[int] {
+        if not Jobs.checkPrefix(prefix) {
+            return Result.Err(Error("JobsConfigError", f"invalid table prefix {prefix}"))
+        }
+        exists: list[dict[str, any]] = db.query("SELECT to_regclass(?)::text AS name", [prefix + "schema_version"])?
+        if JobsRow.str(exists[0], "name") == "" {
+            return Result.Ok(0)
+        }
+        rows: list[dict[str, any]] = db.query(f"SELECT COALESCE(MAX(version), 0)::bigint AS version FROM {prefix}schema_version", [])?
+        return Result.Ok(JobsRow.int(rows[0], "version"))
+    }
+
+    #- Drops every table under ``prefix`` (tests, uninstall). -#
+    static func dropSchema(db: Db, prefix: str = JobsDefaultPrefix) -> Result[bool] {
+        if not Jobs.checkPrefix(prefix) {
+            return Result.Err(Error("JobsConfigError", f"invalid table prefix {prefix}"))
+        }
+        tx: Tx = db.begin()?
+        do {
+            _ = tx.exec("SELECT pg_advisory_xact_lock(hashtext(?)::bigint)", [prefix + "migrate"])?
+            for name in ["queue", "instances", "health", "schedules", "leases", "schema_version"] {
+                _ = tx.exec(f"DROP TABLE IF EXISTS {prefix}{name}", [])?
+            }
+            _ = tx.commit()?
+        } catch err {
+            _ = tx.rollback()
+            return Result.Err(Error("JobsMigrationError", JobsRow.errText(err), err))
+        }
+        return Result.Ok(true)
+    }
+}
+
+func main() {
+    pass
+}

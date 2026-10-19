@@ -1,0 +1,291 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — 5-field cron expressions evaluated in UTC.
+
+from lamerrors import Result, Error
+from lamconv import Conv
+
+const JobsMonthNames: list[str] = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+const JobsDayNames: list[str] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]
+
+#- A parsed cron expression: ``minute hour day-of-month month day-of-week``.
+
+   Each field accepts ``*`` (or ``?``), numbers, ranges ``a-b``, steps
+   ``*/n``, ``a-b/n`` and ``a/n`` (``a`` to the field maximum) and
+   comma-separated lists of those. Months accept ``JAN``-``DEC`` and days of
+   the week ``SUN``-``SAT`` (case-insensitive); day-of-week ``0`` and ``7``
+   are Sunday. As in Vixie cron, when both day fields are restricted (neither
+   starts with ``*``) a day matches if *either* field matches. Macros:
+   ``@yearly``/``@annually``, ``@monthly``, ``@weekly``, ``@daily``/
+   ``@midnight``, ``@hourly``. All times are UTC. -#
+class CronSchedule {
+    func init(self, expr: str) {
+        self.expr: str = expr
+        self.minutes: list[bool] = []
+        self.hours: list[bool] = []
+        self.days: list[bool] = []
+        self.months: list[bool] = []
+        self.weekdays: list[bool] = []
+        self.dayStar: bool = true
+        self.weekdayStar: bool = true
+    }
+
+    #- Parses ``expr``; malformed expressions are ``CronParseError``. -#
+    static func parse(expr: str) -> Result[CronSchedule] {
+        text: str = expr.trim()
+        lowered: str = text.toLower()
+        if lowered == "@yearly" or lowered == "@annually" {
+            text = "0 0 1 1 *"
+        } elif lowered == "@monthly" {
+            text = "0 0 1 * *"
+        } elif lowered == "@weekly" {
+            text = "0 0 * * 0"
+        } elif lowered == "@daily" or lowered == "@midnight" {
+            text = "0 0 * * *"
+        } elif lowered == "@hourly" {
+            text = "0 * * * *"
+        } elif lowered.startsWith("@") {
+            return Result.Err(Error("CronParseError", f"unsupported cron macro {expr}"))
+        }
+        fields: list[str] = text.fields()
+        if len(fields) != 5 {
+            return Result.Err(Error("CronParseError", f"cron expression {expr} must have 5 fields (minute hour day month weekday), got {len(fields)}"))
+        }
+        schedule: CronSchedule = CronSchedule(expr.trim())
+        schedule.minutes = CronSchedule.parseField(fields[0], 0, 59, [], "minute")?
+        schedule.hours = CronSchedule.parseField(fields[1], 0, 23, [], "hour")?
+        schedule.days = CronSchedule.parseField(fields[2], 1, 31, [], "day-of-month")?
+        schedule.months = CronSchedule.parseField(fields[3], 1, 12, JobsMonthNames, "month")?
+        weekdays: list[bool] = CronSchedule.parseField(fields[4], 0, 7, JobsDayNames, "day-of-week")?
+        if weekdays[7] {
+            weekdays[0] = true
+        }
+        schedule.weekdays = weekdays[0:7]
+        schedule.dayStar = fields[2].startsWith("*") or fields[2].startsWith("?")
+        schedule.weekdayStar = fields[4].startsWith("*") or fields[4].startsWith("?")
+        if schedule.next(0) < 0 {
+            return Result.Err(Error("CronParseError", f"cron expression {expr} never matches"))
+        }
+        return Result.Ok(schedule)
+    }
+
+    #- True when ``expr`` parses. -#
+    static func valid(expr: str) -> bool {
+        r: Result[CronSchedule] = CronSchedule.parse(expr)
+        return r.ok()
+    }
+
+    #- A number, or a name from ``names`` (index + ``low`` offset: months
+       start at 1, weekdays at 0). -1 when invalid. -#
+    static func parseValue(token: str, low: int, names: list[str]) -> int {
+        if token == "" {
+            return -1
+        }
+        upper: str = token.toUpper()
+        index: int = 0
+        for name in names {
+            if upper == name {
+                return index + low
+            }
+            index += 1
+        }
+        if not token.isDigit() or len(token) > 4 {
+            return -1
+        }
+        parsed: Result[int] = Conv.parse(token)
+        if not parsed.ok() {
+            return -1
+        }
+        value: int = parsed.unwrap()
+        return value
+    }
+
+    #- Expands one field into a ``high + 1`` long membership list. -#
+    static func parseField(field: str, low: int, high: int, names: list[str], label: str) -> Result[list[bool]] {
+        out: list[bool] = []
+        for i in range(high + 1) {
+            out.append(false)
+        }
+        if field == "" {
+            return Result.Err(Error("CronParseError", f"empty {label} field"))
+        }
+        for part in field.split(",") {
+            if part == "" {
+                return Result.Err(Error("CronParseError", f"empty list item in {label} field {field}"))
+            }
+            rangeText: str = part
+            step: int = 1
+            slash: int = part.index("/")
+            if slash >= 0 {
+                rangeText = part[0:slash]
+                stepText: str = part[slash + 1:]
+                step = CronSchedule.parseValue(stepText, 0, [])
+                if step <= 0 {
+                    return Result.Err(Error("CronParseError", f"invalid step {stepText} in {label} field {field}"))
+                }
+            }
+            start: int = low
+            end: int = high
+            if rangeText == "*" or rangeText == "?" {
+                start = low
+                end = high
+            } else {
+                dash: int = rangeText.index("-")
+                if dash >= 0 {
+                    start = CronSchedule.parseValue(rangeText[0:dash], low, names)
+                    end = CronSchedule.parseValue(rangeText[dash + 1:], low, names)
+                } else {
+                    start = CronSchedule.parseValue(rangeText, low, names)
+                    end = start
+                    if slash >= 0 {
+                        end = high
+                    }
+                }
+                if start < 0 or end < 0 {
+                    return Result.Err(Error("CronParseError", f"invalid value {rangeText} in {label} field {field}"))
+                }
+            }
+            if start < low or end > high or start > high or end < low {
+                return Result.Err(Error("CronParseError", f"{label} value out of range {low}-{high} in {field}"))
+            }
+            if start > end {
+                return Result.Err(Error("CronParseError", f"descending range {rangeText} in {label} field {field}"))
+            }
+            value: int = start
+            while value <= end {
+                out[value] = true
+                value += step
+            }
+        }
+        return Result.Ok(out)
+    }
+
+    #- Days since 1970-01-01 of a proleptic Gregorian date. -#
+    static func daysFromCivil(year: int, month: int, day: int) -> int {
+        y: int = year
+        if month <= 2 {
+            y -= 1
+        }
+        era: int = y // 400
+        yoe: int = y - era * 400
+        mp: int = month - 3
+        if month <= 2 {
+            mp = month + 9
+        }
+        doy: int = (153 * mp + 2) // 5 + day - 1
+        doe: int = yoe * 365 + yoe // 4 - yoe // 100 + doy
+        return era * 146097 + doe - 719468
+    }
+
+    #- [year, month, day] of a day count since 1970-01-01 (non-negative). -#
+    static func civilFromDays(days: int) -> list[int] {
+        z: int = days + 719468
+        era: int = z // 146097
+        doe: int = z - era * 146097
+        yoe: int = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+        year: int = yoe + era * 400
+        # lamc 2.1.1 drops the parentheses of a parenthesised right operand of
+        # ``-`` (``a - (b + c)`` becomes ``a - b + c``): use a temporary.
+        yearStart: int = 365 * yoe + yoe // 4 - yoe // 100
+        doy: int = doe - yearStart
+        mp: int = (5 * doy + 2) // 153
+        day: int = doy - (153 * mp + 2) // 5 + 1
+        month: int = mp + 3
+        if mp >= 10 {
+            month = mp - 9
+        }
+        if month <= 2 {
+            year += 1
+        }
+        out: list[int] = [year, month, day]
+        return out
+    }
+
+    func dayMatches(self, day: int, weekday: int) -> bool {
+        if self.dayStar or self.weekdayStar {
+            return self.days[day] and self.weekdays[weekday]
+        }
+        return self.days[day] or self.weekdays[weekday]
+    }
+
+    #- True when the minute containing ``unix`` matches. -#
+    func matches(self, unix: int) -> bool {
+        if unix < 0 {
+            return false
+        }
+        minuteIndex: int = unix // 60
+        days: int = minuteIndex // 1440
+        minuteOfDay: int = minuteIndex % 1440
+        date: list[int] = CronSchedule.civilFromDays(days)
+        weekday: int = (days + 4) % 7
+        return self.months[date[1]] and self.dayMatches(date[2], weekday) and self.hours[minuteOfDay // 60] and self.minutes[minuteOfDay % 60]
+    }
+
+    #- The first matching minute strictly after ``afterUnix`` (Unix seconds,
+       UTC), or -1 when none exists within 8 years (e.g. ``0 0 30 2 *``). -#
+    func next(self, afterUnix: int) -> int {
+        start: int = afterUnix
+        if start < -1 {
+            start = -1
+        }
+        t: int = (start + 60) // 60
+        if start < 0 {
+            t = 0
+        }
+        limit: int = t + 8 * 366 * 1440
+        while t <= limit {
+            days: int = t // 1440
+            minuteOfDay: int = t % 1440
+            date: list[int] = CronSchedule.civilFromDays(days)
+            year: int = date[0]
+            month: int = date[1]
+            if not self.months[month] {
+                if month == 12 {
+                    t = CronSchedule.daysFromCivil(year + 1, 1, 1) * 1440
+                } else {
+                    t = CronSchedule.daysFromCivil(year, month + 1, 1) * 1440
+                }
+                continue
+            }
+            weekday: int = (days + 4) % 7
+            if not self.dayMatches(date[2], weekday) {
+                t = (days + 1) * 1440
+                continue
+            }
+            hour: int = minuteOfDay // 60
+            if not self.hours[hour] {
+                t = days * 1440 + (hour + 1) * 60
+                continue
+            }
+            if not self.minutes[minuteOfDay % 60] {
+                t += 1
+                continue
+            }
+            return t * 60
+        }
+        return -1
+    }
+
+    #- The next ``count`` run times after ``afterUnix``. -#
+    func nextN(self, afterUnix: int, count: int) -> list[int] {
+        out: list[int] = []
+        t: int = afterUnix
+        for i in range(count) {
+            t = self.next(t)
+            if t < 0 {
+                break
+            }
+            out.append(t)
+        }
+        return out
+    }
+
+    func __str__(self) -> str {
+        return self.expr
+    }
+}
+
+func main() {
+    pass
+}

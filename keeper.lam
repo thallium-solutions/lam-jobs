@@ -1,0 +1,88 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — background helpers shared by leases, schedulers, heartbeats
+# and workers: a periodic callback with prompt shutdown, and a stop signal
+# that doubles as an interruptible sleep.
+
+from lamerrors import Result
+from lamconcurrency import Channel, WaitGroup, Atomic
+
+#- A one-shot stop signal. ``sleep(ms)`` waits until the time elapsed (true)
+   or ``fire()`` was called (false); ``fire`` is idempotent. -#
+class JobsSignal {
+    func init(self) {
+        self.channel: Channel = Channel(0)
+        self.fired: Atomic = Atomic(0)
+    }
+
+    func fire(self) {
+        if self.fired.compareAndSwap(0, 1) {
+            _ = self.channel.close()
+        }
+    }
+
+    func isFired(self) -> bool {
+        return self.fired.get() == 1
+    }
+
+    #- True when the full ``ms`` elapsed, false when the signal fired. -#
+    func sleep(self, ms: int) -> bool {
+        if self.isFired() {
+            return false
+        }
+        if ms <= 0 {
+            return true
+        }
+        r: Result[any] = self.channel.receiveTimeout(ms)
+        if r.ok() {
+            return false
+        }
+        return r.error.kind == "ChannelTimeout"
+    }
+}
+
+#- Calls ``fn`` every ``everyMs`` milliseconds in the background until
+   ``stop()`` (which waits for a running call) or until ``fn`` returns
+   false. Used to renew leases while long jobs run. -#
+class JobsKeeper {
+    func init(self, everyMs: int, fn: func() -> bool) {
+        self.everyMs: int = everyMs if everyMs > 0 else 1000
+        self.fn: func() -> bool = fn
+        self.signal: JobsSignal = JobsSignal()
+        self.group: WaitGroup = WaitGroup()
+        self.started: Atomic = Atomic(0)
+    }
+
+    async func loop(self) {
+        while self.signal.sleep(self.everyMs) {
+            keep: bool = true
+            try {
+                keep = self.fn()
+            } catch err {
+                keep = true
+            }
+            if not keep {
+                break
+            }
+        }
+        self.group.done()
+    }
+
+    func start(self) {
+        if not self.started.compareAndSwap(0, 1) {
+            return
+        }
+        self.group.add(1)
+        _ = self.loop()
+    }
+
+    func stop(self) {
+        self.signal.fire()
+        self.group.wait()
+    }
+}
+
+func main() {
+    pass
+}

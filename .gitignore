@@ -1,0 +1,17 @@
+# Lammergeier build artefacts
+/build/
+*.lamc-cache/
+
+# Project-local installed libraries — uncomment to commit them
+# (Go-style "vendor everything"). Keeping them out of git is the
+# default; the lockfile alone is enough to reproduce the build.
+/extlibs/
+
+# Python virtual environments and tool caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

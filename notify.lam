@@ -1,0 +1,244 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — wake-ups for idle queue workers: an in-process broadcast
+# (``JobsWake``) and an optional PostgreSQL LISTEN/NOTIFY listener
+# (``JobsListener``, lib/pq, already linked by lamdb) that turns
+# notifications sent by ``JobQueue.enqueue`` in any process into wake-ups.
+# Workers always keep polling as well, so a missed notification only delays
+# a job by one poll interval.
+
+from lamerrors import Result, Error
+
+go! {
+    import (
+        "sync"
+        "time"
+
+        "github.com/lib/pq"
+    )
+
+    // jobsWaker is a broadcast: every wake-up releases all current waiters.
+    // close() releases them for good (shutdown).
+    type jobsWaker struct {
+        mu     sync.Mutex
+        ch     chan struct{}
+        closed bool
+    }
+
+    func jobsNewWaker() *jobsWaker {
+        return &jobsWaker{ch: make(chan struct{})}
+    }
+
+    func (w *jobsWaker) broadcast() {
+        w.mu.Lock()
+        defer w.mu.Unlock()
+        if w.closed {
+            return
+        }
+        close(w.ch)
+        w.ch = make(chan struct{})
+    }
+
+    func (w *jobsWaker) shutdown() {
+        w.mu.Lock()
+        defer w.mu.Unlock()
+        if w.closed {
+            return
+        }
+        w.closed = true
+        close(w.ch)
+    }
+
+    func (w *jobsWaker) isClosed() bool {
+        w.mu.Lock()
+        defer w.mu.Unlock()
+        return w.closed
+    }
+
+    // wait returns true when woken (or closed) before ms elapsed.
+    func (w *jobsWaker) wait(ms int) bool {
+        w.mu.Lock()
+        ch := w.ch
+        closed := w.closed
+        w.mu.Unlock()
+        if closed {
+            return true
+        }
+        if ms <= 0 {
+            return false
+        }
+        timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
+        defer timer.Stop()
+        select {
+        case <-ch:
+            return true
+        case <-timer.C:
+            return false
+        }
+    }
+
+    type jobsPgListener struct {
+        listener *pq.Listener
+        done     chan struct{}
+        once     sync.Once
+        mu       sync.Mutex
+        wakes    int
+    }
+
+    // jobsListen subscribes to channel and wakes waker for every notification
+    // whose payload is in topics (all payloads when topics is empty) and after
+    // every reconnect (notifications may have been missed meanwhile).
+    func jobsListen(dsn string, channel string, topics []string, waker *jobsWaker) (*jobsPgListener, error) {
+        listener := pq.NewListener(dsn, 200*time.Millisecond, 30*time.Second, nil)
+        if err := listener.Listen(channel); err != nil {
+            listener.Close()
+            return nil, err
+        }
+        wanted := map[string]bool{}
+        for _, topic := range topics {
+            wanted[topic] = true
+        }
+        l := &jobsPgListener{listener: listener, done: make(chan struct{})}
+        go func() {
+            ping := time.NewTicker(60 * time.Second)
+            defer ping.Stop()
+            for {
+                select {
+                case <-l.done:
+                    return
+                case n, ok := <-listener.Notify:
+                    if !ok {
+                        return
+                    }
+                    if n == nil || len(wanted) == 0 || wanted[n.Extra] {
+                        l.mu.Lock()
+                        l.wakes++
+                        l.mu.Unlock()
+                        waker.broadcast()
+                    }
+                case <-ping.C:
+                    go listener.Ping()
+                }
+            }
+        }()
+        return l, nil
+    }
+
+    func (l *jobsPgListener) close() {
+        l.once.Do(func() {
+            close(l.done)
+            l.listener.Close()
+        })
+    }
+
+    func (l *jobsPgListener) count() int {
+        l.mu.Lock()
+        defer l.mu.Unlock()
+        return l.wakes
+    }
+}
+
+#- A broadcast wake-up: ``wait(ms)`` returns true as soon as ``wake()`` (or
+   ``close()``) is called, false when ``ms`` elapsed first. Every waiter is
+   released by one ``wake()``. -#
+class JobsWake {
+    func init(self) {
+        self.handle: any = go!(jobsNewWaker())
+    }
+
+    func wake(self) {
+        h: any = self.handle
+        go! {
+            h.(*jobsWaker).broadcast()
+        }
+    }
+
+    #- Releases every waiter now and in the future (shutdown). -#
+    func close(self) {
+        h: any = self.handle
+        go! {
+            h.(*jobsWaker).shutdown()
+        }
+    }
+
+    func isClosed(self) -> bool {
+        h: any = self.handle
+        out: bool = false
+        go! {
+            out = h.(*jobsWaker).isClosed()
+        }
+        return out
+    }
+
+    func wait(self, ms: int) -> bool {
+        h: any = self.handle
+        out: bool = false
+        go! {
+            out = h.(*jobsWaker).wait(ms)
+        }
+        return out
+    }
+}
+
+#- A PostgreSQL LISTEN on ``channel`` that wakes ``wake`` for notifications
+   whose payload is one of ``topics`` (any payload when ``topics`` is
+   empty). Reconnects automatically (and wakes after a reconnect). -#
+class JobsListener {
+    func init(self, wake: JobsWake) {
+        self.wake: JobsWake = wake
+        self.handle: any = None
+        self.channel: str = ""
+    }
+
+    #- Connects and subscribes. ``JobsListenError`` when the connection or
+       the LISTEN fails. -#
+    static func open(databaseUrl: str, channel: str, topics: list[str], wake: JobsWake) -> Result[JobsListener] {
+        if not (databaseUrl.startsWith("postgres://") or databaseUrl.startsWith("postgresql://") or databaseUrl.contains("=")) {
+            return Result.Err(Error("JobsListenError", "LISTEN needs a PostgreSQL connection string"))
+        }
+        out: JobsListener = JobsListener(wake)
+        out.channel = channel
+        waker: any = wake.handle
+        problem: str = ""
+        handle: any = None
+        go! {
+            l, err := jobsListen(databaseUrl, channel, topics, waker.(*jobsWaker))
+            if err != nil {
+                problem = err.Error()
+            } else {
+                handle = l
+            }
+        }
+        if problem != "" {
+            return Result.Err(Error("JobsListenError", problem))
+        }
+        out.handle = handle
+        return Result.Ok(out)
+    }
+
+    #- How many wake-ups notifications caused so far (diagnostics, tests). -#
+    func wakeups(self) -> int {
+        h: any = self.handle
+        out: int = 0
+        go! {
+            if l, ok := h.(*jobsPgListener); ok && l != nil {
+                out = l.count()
+            }
+        }
+        return out
+    }
+
+    func close(self) {
+        h: any = self.handle
+        go! {
+            if l, ok := h.(*jobsPgListener); ok && l != nil {
+                l.close()
+            }
+        }
+    }
+}
+
+func main() {
+    pass
+}

@@ -1,0 +1,406 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — periodic and cron jobs that run once per due time across all
+# instances (table ``<prefix>schedules``). Each job row holds its next run
+# time and a running lease: an instance runs a job only after atomically
+# moving ``next_run_at`` forward and taking the lease, so replicas never
+# double-run a job and never overlap a slow run. Outcomes go to
+# ``JobHealth``.
+
+from lamdb import Db
+from lamerrors import Result, Error
+from lamconcurrency import Mutex, Atomic, WaitGroup
+from lamlog import Log
+from lamtime import Time
+from .schema import Jobs, JobsRow, JobsDefaultPrefix
+from .cron import CronSchedule
+from .keeper import JobsKeeper, JobsSignal
+from .health import JobHealth
+
+#- A registered job (internal). -#
+class JobsScheduled {
+    func init(self, name: str, spec: str, intervalSeconds: int, cron: CronSchedule, fn: func() -> Result[int], lockSeconds: int) {
+        self.name: str = name
+        self.spec: str = spec
+        self.intervalSeconds: int = intervalSeconds
+        self.cron: CronSchedule = cron
+        self.fn: func() -> Result[int] = fn
+        self.lockSeconds: int = lockSeconds
+    }
+
+    func isCron(self) -> bool {
+        return self.intervalSeconds <= 0
+    }
+
+    #- The first run time of a newly registered (or re-specified) job. -#
+    func firstRun(self, nowUnix: int) -> int {
+        if self.isCron() {
+            return self.cron.next(nowUnix)
+        }
+        return nowUnix
+    }
+}
+
+#- The shared state of one scheduled job. Times are Unix seconds
+   (0 = never); ``running`` is true while an instance holds its lease. -#
+class JobSchedule {
+    func init(self, name: str) {
+        self.name: str = name
+        self.spec: str = ""
+        self.nextRunAt: int = 0
+        self.paused: bool = false
+        self.running: bool = false
+        self.runningOwner: str = ""
+        self.lastOwner: str = ""
+        self.lastStartedAt: int = 0
+        self.lastFinishedAt: int = 0
+        self.runs: int = 0
+    }
+
+    static func fromRow(row: dict[str, any]) -> JobSchedule {
+        out: JobSchedule = JobSchedule(JobsRow.str(row, "name"))
+        out.spec = JobsRow.str(row, "spec")
+        out.nextRunAt = JobsRow.int(row, "next_run_at")
+        out.paused = JobsRow.bool(row, "paused")
+        out.running = JobsRow.bool(row, "running")
+        if out.running {
+            out.runningOwner = JobsRow.str(row, "running_owner")
+        }
+        out.lastOwner = JobsRow.str(row, "last_owner")
+        out.lastStartedAt = JobsRow.int(row, "last_started_at")
+        out.lastFinishedAt = JobsRow.int(row, "last_finished_at")
+        out.runs = JobsRow.int(row, "runs")
+        return out
+    }
+
+    func __json__(self) -> json {
+        return {"name": self.name, "spec": self.spec, "nextRunAt": self.nextRunAt, "paused": self.paused, "running": self.running, "runningOwner": self.runningOwner, "lastOwner": self.lastOwner, "lastStartedAt": self.lastStartedAt, "lastFinishedAt": self.lastFinishedAt, "runs": self.runs}
+    }
+}
+
+const JobsScheduleColumns: str = "name, spec, EXTRACT(EPOCH FROM next_run_at)::bigint AS next_run_at, paused, COALESCE(running_until > now(), FALSE) AS running, COALESCE(running_owner, '') AS running_owner, last_owner, COALESCE(EXTRACT(EPOCH FROM last_started_at)::bigint, 0) AS last_started_at, COALESCE(EXTRACT(EPOCH FROM last_finished_at)::bigint, 0) AS last_finished_at, runs"
+
+#- Runs registered jobs when due, once across every instance sharing the
+   database and ``prefix``. Job functions return ``Ok(count)`` (any number
+   worth recording, e.g. items processed) or an error; both are recorded in
+   ``health``. -#
+class JobScheduler {
+    func init(self, db: Db, owner: str = "", prefix: str = JobsDefaultPrefix) {
+        Jobs.requirePrefix(prefix)
+        self.db: Db = db
+        self.owner: str = owner if owner != "" else Jobs.newOwner()
+        self.prefix: str = prefix
+        self.table: str = prefix + "schedules"
+        self.health: JobHealth = JobHealth(db, prefix)
+        self.jobs: list[JobsScheduled] = []
+        self.registered: bool = false
+        self.pollMs: int = 1000
+        self.logFailures: bool = true
+        self.mu: Mutex = Mutex()
+        self.running: dict[str, bool] = {}
+        self.started: Atomic = Atomic(0)
+        self.signal: JobsSignal = JobsSignal()
+        self.group: WaitGroup = WaitGroup()
+    }
+
+    func add(self, job: JobsScheduled) -> JobScheduler {
+        if job.name == "" {
+            throw ValueError("@lam/jobs: job name must not be empty")
+        }
+        if job.lockSeconds < 3 {
+            throw ValueError("@lam/jobs: lockSeconds must be at least 3")
+        }
+        for existing in self.jobs {
+            if existing.name == job.name {
+                throw ValueError(f"@lam/jobs: job {job.name} is already registered")
+            }
+        }
+        self.jobs.append(job)
+        self.registered = false
+        return self
+    }
+
+    #- Runs ``fn`` every ``intervalSeconds`` (first run at the first tick).
+       ``lockSeconds`` is the running lease, renewed every third of it while
+       ``fn`` runs: another instance can take over a crashed run after it. -#
+    func every(self, name: str, intervalSeconds: int, fn: func() -> Result[int], lockSeconds: int = 60) -> JobScheduler {
+        if intervalSeconds < 1 {
+            throw ValueError("@lam/jobs: intervalSeconds must be positive")
+        }
+        return self.add(JobsScheduled(name, f"every {intervalSeconds}s", intervalSeconds, None, fn, lockSeconds))
+    }
+
+    #- Runs ``fn`` at the times of the 5-field cron expression ``expr``
+       (UTC). An invalid expression throws ``ValueError``; validate
+       user-supplied ones with ``CronSchedule.parse``. -#
+    func cron(self, name: str, expr: str, fn: func() -> Result[int], lockSeconds: int = 60) -> JobScheduler {
+        parsed: Result[CronSchedule] = CronSchedule.parse(expr)
+        if not parsed.ok() {
+            throw ValueError(f"@lam/jobs: job {name}: {JobsRow.errText(parsed.error)}")
+        }
+        schedule: CronSchedule = parsed.unwrap()
+        return self.add(JobsScheduled(name, f"cron {schedule.expr}", 0, schedule, fn, lockSeconds))
+    }
+
+    #- How often ``run()`` checks for due jobs (default 1000 ms). -#
+    func withPollInterval(self, ms: int) -> JobScheduler {
+        self.pollMs = ms if ms > 10 else 10
+        return self
+    }
+
+    #- Do not log job failures (``lamlog`` errors). -#
+    func quiet(self) -> JobScheduler {
+        self.logFailures = false
+        return self
+    }
+
+    #- Names of the registered jobs. -#
+    func names(self) -> list[str] {
+        return [job.name for job in self.jobs]
+    }
+
+    #- Creates the rows of the registered jobs; a job whose schedule text
+       changed is rescheduled from ``nowUnix``. ``tick`` calls it. -#
+    func register(self, nowUnix: int) -> Result[int] {
+        t: str = self.table
+        changed: int = 0
+        for job in self.jobs {
+            n: int = self.db.exec(f"INSERT INTO {t} (name, spec, next_run_at) VALUES (?, ?, to_timestamp(?::bigint)) ON CONFLICT (name) DO UPDATE SET spec = EXCLUDED.spec, next_run_at = EXCLUDED.next_run_at, updated_at = now() WHERE {t}.spec <> EXCLUDED.spec", [job.name, job.spec, job.firstRun(nowUnix)])?
+            changed += n
+        }
+        self.registered = true
+        return Result.Ok(changed)
+    }
+
+    #- Takes the next run of ``job`` if it is due at ``nowUnix`` (any time
+       with ``force``) and no instance is running it. -#
+    func claim(self, job: JobsScheduled, nowUnix: int, force: bool) -> Result[bool] {
+        t: str = self.table
+        cronNext: int = 0
+        if job.isCron() {
+            cronNext = job.cron.next(nowUnix)
+        }
+        interval: int = job.intervalSeconds
+        rows: list[dict[str, any]] = self.db.query(f"UPDATE {t} SET next_run_at = CASE WHEN ?::boolean THEN to_timestamp(?::bigint) WHEN next_run_at + make_interval(secs => ?::bigint) > to_timestamp(?::bigint) THEN next_run_at + make_interval(secs => ?::bigint) ELSE to_timestamp(?::bigint) END, running_owner = ?, running_until = now() + make_interval(secs => ?::bigint), last_owner = ?, last_started_at = now(), runs = runs + 1, updated_at = now() WHERE name = ? AND NOT paused AND (running_until IS NULL OR running_until <= now()) AND (?::boolean OR next_run_at <= to_timestamp(?::bigint)) RETURNING name", [job.isCron(), cronNext, interval, nowUnix, interval, nowUnix + interval, self.owner, job.lockSeconds, self.owner, job.name, force, nowUnix])?
+        return Result.Ok(len(rows) > 0)
+    }
+
+    func renewRun(self, name: str, lockSeconds: int) -> bool {
+        r: Result[int] = self.db.exec(f"UPDATE {self.table} SET running_until = now() + make_interval(secs => ?::bigint) WHERE name = ? AND running_owner = ?", [lockSeconds, name, self.owner])
+        if not r.ok() {
+            return true
+        }
+        return r.unwrap() > 0
+    }
+
+    #- Runs a claimed job and records it; returns its count, -1 on failure. -#
+    func execute(self, job: JobsScheduled) -> int {
+        sched: JobScheduler = self
+        name: str = job.name
+        lockSeconds: int = job.lockSeconds
+        keeper: JobsKeeper = JobsKeeper(lockSeconds * 1000 // 3, lambda() -> bool: sched.renewRun(name, lockSeconds))
+        keeper.start()
+        started: int = Time.nowUnixMilli()
+        fn: func() -> Result[int] = job.fn
+        outcome: Result[int] = Result.Ok(0)
+        try {
+            outcome = fn()
+        } catch err {
+            outcome = Result.Err(Error("JobsHandlerException", f"{err}"))
+        }
+        elapsed: int = Time.nowUnixMilli() - started
+        keeper.stop()
+        released: Result[int] = self.db.exec(f"UPDATE {self.table} SET running_owner = NULL, running_until = NULL, last_finished_at = now(), updated_at = now() WHERE name = ? AND running_owner = ?", [name, self.owner])
+        if not released.ok() {
+            Log.warn(f"@lam/jobs: releasing job {name}: {JobsRow.errText(released.error)}")
+        }
+        count: int = -1
+        if outcome.ok() {
+            count = outcome.unwrap()
+            recorded: Result[bool] = self.health.success(name, elapsed, count)
+            if not recorded.ok() {
+                Log.warn(f"@lam/jobs: recording job {name}: {JobsRow.errText(recorded.error)}")
+            }
+        } else {
+            problem: str = JobsRow.errText(outcome.error)
+            if self.logFailures {
+                Log.error(f"@lam/jobs: job {name} failed: {problem}")
+            }
+            recorded: Result[bool] = self.health.failure(name, problem, elapsed)
+            if not recorded.ok() {
+                Log.warn(f"@lam/jobs: recording job {name}: {JobsRow.errText(recorded.error)}")
+            }
+        }
+        return count
+    }
+
+    #- Runs, in this call, every job due at ``nowUnix`` (all jobs with
+       ``force``) that no instance is running. Returns the jobs run here
+       and their counts (-1 = failed). For tests and CLIs; services use
+       ``start``/``run``. -#
+    func tick(self, nowUnix: int, force: bool = false) -> Result[dict[str, int]] {
+        if not self.registered {
+            _ = self.register(nowUnix)?
+        }
+        results: dict[str, int] = {}
+        for job in self.jobs {
+            if self.isRunningHere(job.name) {
+                continue
+            }
+            claimed: bool = self.claim(job, nowUnix, force)?
+            if claimed {
+                results[job.name] = self.execute(job)
+            }
+        }
+        return Result.Ok(results)
+    }
+
+    func isRunningHere(self, name: str) -> bool {
+        self.mu.lock()
+        busy: bool = name in self.running and self.running[name]
+        self.mu.unlock()
+        return busy
+    }
+
+    func setRunningHere(self, name: str, busy: bool) {
+        self.mu.lock()
+        self.running[name] = busy
+        self.mu.unlock()
+    }
+
+    async func executeAsync(self, job: JobsScheduled) {
+        try {
+            _ = self.execute(job)
+        } catch err {
+            Log.error(f"@lam/jobs: job {job.name}: {err}")
+        }
+        self.setRunningHere(job.name, false)
+        self.group.done()
+    }
+
+    #- One background round: claims due jobs and starts each in its own
+       task, so a slow job does not delay the others. -#
+    func dispatch(self, nowUnix: int) -> Result[int] {
+        if not self.registered {
+            _ = self.register(nowUnix)?
+        }
+        started: int = 0
+        for job in self.jobs {
+            if self.signal.isFired() {
+                break
+            }
+            if self.isRunningHere(job.name) {
+                continue
+            }
+            claimed: bool = self.claim(job, nowUnix, false)?
+            if claimed {
+                self.setRunningHere(job.name, true)
+                self.group.add(1)
+                _ = self.executeAsync(job)
+                started += 1
+            }
+        }
+        return Result.Ok(started)
+    }
+
+    async func loop(self) {
+        while true {
+            try {
+                r: Result[int] = self.dispatch(Time.nowUnix())
+                if not r.ok() {
+                    Log.warn(f"@lam/jobs scheduler: {JobsRow.errText(r.error)}")
+                }
+            } catch err {
+                Log.error(f"@lam/jobs scheduler: {err}")
+            }
+            if not self.signal.sleep(self.pollMs) {
+                break
+            }
+        }
+        self.group.done()
+    }
+
+    #- Starts the scheduler in the background (idempotent). -#
+    func start(self) {
+        if not self.started.compareAndSwap(0, 1) {
+            return
+        }
+        self.group.add(1)
+        _ = self.loop()
+    }
+
+    #- ``start()`` and block until ``stop()`` is called elsewhere. -#
+    func run(self) {
+        self.start()
+        self.group.wait()
+    }
+
+    #- Stops scheduling and waits for running jobs to finish. -#
+    func stop(self) {
+        self.signal.fire()
+        if self.started.get() == 1 {
+            self.group.wait()
+        }
+    }
+
+    # ── administration ────────────────────────────────────────────────
+
+    #- Pauses ``name`` on every instance (until ``resume``). -#
+    func pause(self, name: str) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET paused = TRUE, updated_at = now() WHERE name = ?", [name])?
+        return Result.Ok(n > 0)
+    }
+
+    func resume(self, name: str) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET paused = FALSE, updated_at = now() WHERE name = ?", [name])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Makes ``name`` due now (it runs at the next tick of any instance). -#
+    func trigger(self, name: str) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET next_run_at = now(), updated_at = now() WHERE name = ?", [name])?
+        return Result.Ok(n > 0)
+    }
+
+    #- The shared state of ``name``; ``JobsNotFound`` before registration. -#
+    func get(self, name: str) -> Result[JobSchedule] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsScheduleColumns} FROM {self.table} WHERE name = ?", [name])?
+        if len(rows) == 0 {
+            return Result.Err(Error("JobsNotFound", f"no scheduled job {name}"))
+        }
+        return Result.Ok(JobSchedule.fromRow(rows[0]))
+    }
+
+    #- Every scheduled job known to the database (all instances), by name. -#
+    func list(self) -> Result[list[JobSchedule]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT {JobsScheduleColumns} FROM {self.table} ORDER BY name", [])?
+        out: list[JobSchedule] = []
+        for row in rows {
+            out.append(JobSchedule.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Deletes the rows of jobs no longer registered by this scheduler
+       (renamed or retired jobs). Returns how many were removed. -#
+    func forgetOthers(self) -> Result[int] {
+        if len(self.jobs) == 0 {
+            return self.db.exec(f"DELETE FROM {self.table}", [])
+        }
+        return self.db.exec(f"DELETE FROM {self.table} WHERE NOT (name = ANY(string_to_array(?, chr(31))))", [jobsJoinUnit(self.names())])
+    }
+}
+
+#- Joins with the ASCII unit separator (not valid in job names in practice). -#
+func jobsJoinUnit(items: list[str]) -> str {
+    sep: str = ""
+    go! {
+        sep = "\x1f"
+    }
+    return sep.join(items)
+}
+
+func main() {
+    pass
+}

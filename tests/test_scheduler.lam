@@ -1,0 +1,163 @@
+# Test: @lam/jobs JobScheduler — periodic and cron jobs on a simulated
+# clock shared by two instances, failures and exceptions recorded in
+# JobHealth, force, pause/resume/trigger, schedule changes, no catch-up
+# storm after downtime, list/get, and the background run loop with stop().
+#
+# requires: database
+# expect: first tick a: {broken: -1, sync: 3, thrower: -1}
+# expect: same second a: {}
+# expect: b at +30: {broken: -1, thrower: -1}
+# expect: a at +30 after b: {}
+# expect: a at +60: {broken: -1, sync: 3, thrower: -1}
+# expect: cron before the hour: {} (others ran: 3)
+# expect: cron at the hour: {report: 1}
+# expect: cron next: 2027-01-15 10:00
+# expect: forced: {broken: -1, report: 1, sync: 3, thrower: -1}
+# expect: paused forced: {broken: -1, report: 1, thrower: -1}
+# expect: resumed: true
+# expect: triggered report: {report: 1}
+# expect: runs: sync=4 report=4
+# expect: health broken: consecutive=6 error=upstream unavailable
+# expect: health thrower: exception=true
+# expect: health sync: ok=true count=3
+# expect: list: broken/every 30s/false/a,report/cron 0 * * * */false/b,sync/every 60s/false/b,thrower/every 30s/false/a
+# expect: changed spec: every 120s rescheduled=1
+# expect: new spec runs at once: {sync: 3}
+# expect: after downtime: {sync: 3} then {} next +120: true
+# expect: background runs >= 2: true
+# expect: no runs after stop: true
+# expect: forgetOthers: 4
+
+from @lam/jobs import Jobs, JobScheduler, JobSchedule, JobHealth, JobStatus, CronSchedule
+from lamerrors import Result, Error
+from lamdb import Db
+from lamenv import Env
+from lamtime import Time
+from lamconcurrency import Atomic
+
+class Work {
+    func init(self) {
+        self.syncRuns: Atomic = Atomic(0)
+        self.reportRuns: Atomic = Atomic(0)
+        self.bgRuns: Atomic = Atomic(0)
+    }
+
+    func sync(self) -> Result[int] {
+        _ = self.syncRuns.increment()
+        return Result.Ok(3)
+    }
+
+    func report(self) -> Result[int] {
+        _ = self.reportRuns.increment()
+        return Result.Ok(1)
+    }
+
+    func bg(self) -> Result[int] {
+        _ = self.bgRuns.increment()
+        return Result.Ok(0)
+    }
+}
+
+func broken() -> Result[int] {
+    return Result.Err(Error("Upstream", "upstream unavailable"))
+}
+
+func thrower() -> Result[int] {
+    throw ValueError("exploded")
+}
+
+func show(results: dict[str, int]) -> str {
+    keys: list[str] = [k for k in results]
+    keys = keys.sort()
+    return "{" + ", ".join([f"{k}: {results[k]}" for k in keys]) + "}"
+}
+
+func pad(n: int) -> str {
+    return f"0{n}" if n < 10 else f"{n}"
+}
+
+func fmt(t: int) -> str {
+    date: list[int] = CronSchedule.civilFromDays(t // 86400)
+    seconds: int = t % 86400
+    return f"{date[0]}-{pad(date[1])}-{pad(date[2])} {pad(seconds // 3600)}:{pad(seconds % 3600 // 60)}"
+}
+
+func build(db: Db, owner: str, prefix: str, work: Work) -> JobScheduler {
+    s: JobScheduler = JobScheduler(db, owner, prefix).quiet()
+    s.every("sync", 60, work.sync)
+    s.cron("report", "0 * * * *", work.report)
+    s.every("broken", 30, broken)
+    s.every("thrower", 30, thrower)
+    return s
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_sched_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        work: Work = Work()
+        a: JobScheduler = build(db, "a", prefix, work)
+        b: JobScheduler = build(db, "b", prefix, work)
+        t0: int = CronSchedule.daysFromCivil(2027, 1, 15) * 86400 + 8 * 3600 + 10
+
+        print(f"first tick a: {show(a.tick(t0)?)}")
+        print(f"same second a: {show(a.tick(t0 + 1)?)}")
+        print(f"b at +30: {show(b.tick(t0 + 30)?)}")
+        print(f"a at +30 after b: {show(a.tick(t0 + 30)?)}")
+        print(f"a at +60: {show(a.tick(t0 + 60)?)}")
+        hour: int = t0 - 10 + 3600
+        before: dict[str, int] = a.tick(hour - 1)?
+        print(f"cron before the hour: {show({k: before[k] for k in before if k == 'report'})} (others ran: {len(before)})")
+        atHour: dict[str, int] = a.tick(hour)?
+        print(f"cron at the hour: {show({k: atHour[k] for k in atHour if k == 'report'})}")
+        report: JobSchedule = a.get("report")?
+        print(f"cron next: {fmt(report.nextRunAt)}")
+        print(f"forced: {show(b.tick(hour + 1, true)?)}")
+        _ = a.pause("sync")?
+        print(f"paused forced: {show(a.tick(hour + 2, true)?)}")
+        print(f"resumed: {a.resume('sync')?}")
+        _ = a.trigger("report")?
+        triggered: dict[str, int] = b.tick(hour + 3)?
+        print(f"triggered report: {show({k: triggered[k] for k in triggered if k == 'report'})}")
+        print(f"runs: sync={work.syncRuns.get()} report={work.reportRuns.get()}")
+
+        h: JobHealth = a.health
+        brokenHealth: JobStatus = h.get("broken")?
+        print(f"health broken: consecutive={brokenHealth.consecutiveFailures} error={brokenHealth.lastError}")
+        throwerHealth: JobStatus = h.get("thrower")?
+        print(f"health thrower: exception={throwerHealth.lastError.contains('exploded')}")
+        syncHealth: JobStatus = h.get("sync")?
+        print(f"health sync: ok={syncHealth.ok()} count={syncHealth.lastCount}")
+        rows: list[JobSchedule] = a.list()?
+        print(f"list: {','.join([f'{r.name}/{r.spec}/{r.running}/{r.lastOwner}' for r in rows])}")
+
+        c: JobScheduler = JobScheduler(db, "c", prefix).quiet()
+        c.every("sync", 120, work.sync)
+        later: int = hour + 600
+        changed: int = c.register(later)?
+        syncRow: JobSchedule = c.get("sync")?
+        print(f"changed spec: {syncRow.spec} rescheduled={changed}")
+        print(f"new spec runs at once: {show(c.tick(later)?)}")
+        downtime: int = later + 100000
+        first: dict[str, int] = c.tick(downtime)?
+        second: dict[str, int] = c.tick(downtime + 1)?
+        syncRow = c.get("sync")?
+        print(f"after downtime: {show(first)} then {show(second)} next +120: {syncRow.nextRunAt == downtime + 120}")
+
+        bg: JobScheduler = JobScheduler(db, "bg", prefix).quiet().withPollInterval(100)
+        bg.every("bg", 1, work.bg)
+        bg.start()
+        Time.sleepMs(2600)
+        bg.stop()
+        afterStop: int = work.bgRuns.get()
+        print(f"background runs >= 2: {afterStop >= 2}")
+        Time.sleepMs(1200)
+        print(f"no runs after stop: {work.bgRuns.get() == afterStop}")
+        print(f"forgetOthers: {bg.forgetOthers()?}")
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

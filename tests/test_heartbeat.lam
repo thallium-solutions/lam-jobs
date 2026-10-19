@@ -1,0 +1,74 @@
+# Test: @lam/jobs InstanceHeartbeat — beats, alive counts per component
+# and window, listing, background start/stop (the row disappears on a
+# clean stop), crashed instances going stale, and prune.
+#
+# requires: database
+# expect: alive before: 0
+# expect: alive after beats: api=2 worker=1 sftp=0
+# expect: list: api/api-1/1.0.0/true api/api-2/1.0.1/true worker/w-1//true
+# expect: by component: {"api":2,"worker":1}
+# expect: version updated: 1.1.0
+# expect: started beats: true
+# expect: stop removes row: 0
+# expect: stale window: alive(1)=0 alive(90)=2
+# expect: listed stale: false
+# expect: pruned: 3 left 0
+
+from @lam/jobs import Jobs, InstanceHeartbeat, InstanceInfo
+from lamerrors import Result
+from lamdb import Db
+from lamenv import Env
+from lamtime import Time
+from lamjson import Json
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_beat_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        api1: InstanceHeartbeat = InstanceHeartbeat(db, "api", "1.0.0", "api-1", prefix)
+        api2: InstanceHeartbeat = InstanceHeartbeat(db, "api", "1.0.1", "api-2", prefix)
+        worker: InstanceHeartbeat = InstanceHeartbeat(db, "worker", "", "w-1", prefix)
+        print(f"alive before: {api1.alive('api')?}")
+        _ = api1.beat()?
+        _ = api2.beat()?
+        _ = worker.beat()?
+        print(f"alive after beats: api={api1.alive('api')?} worker={api1.alive('worker')?} sftp={api1.alive('sftp', 90)?}")
+        listed: list[InstanceInfo] = api1.list()?
+        parts: list[str] = [f"{i.component}/{i.instance}/{i.version}/{i.alive}" for i in listed]
+        parts = parts.sort()
+        print(f"list: {' '.join(parts)}")
+        counts: dict[str, int] = api1.aliveByComponent()?
+        encoded: str = Json.encode(Json.fromDict(counts)?)?
+        print(f"by component: {encoded}")
+        api1.version = "1.1.0"
+        _ = api1.beat()?
+        only: list[InstanceInfo] = api1.list("api")?
+        version: str = ""
+        for i in only {
+            if i.instance == "api-1" {
+                version = i.version
+            }
+        }
+        print(f"version updated: {version}")
+
+        background: InstanceHeartbeat = InstanceHeartbeat(db, "scheduler", "2", "", prefix).withInterval(1)
+        background.start()
+        Time.sleepMs(300)
+        print(f"started beats: {api1.alive('scheduler')? == 1}")
+        _ = background.stop()?
+        print(f"stop removes row: {api1.alive('scheduler')?}")
+
+        Time.sleepMs(2100)
+        print(f"stale window: alive(1)={api1.alive('api', 1)?} alive(90)={api1.alive('api', 90)?}")
+        stale: list[InstanceInfo] = api1.list("worker", 1)?
+        print(f"listed stale: {stale[0].alive}")
+        pruned: int = api1.prune(1)?
+        left: list[InstanceInfo] = api1.list()?
+        print(f"pruned: {pruned} left {len(left)}")
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

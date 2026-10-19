@@ -1,0 +1,73 @@
+# Test: @lam/jobs schema management — idempotent versioned migrations,
+# concurrent migrators serialised by the advisory lock, independent table
+# prefixes, ensureSchema and dropSchema.
+#
+# requires: database
+# expect: before: 0
+# expect: first migrate: 1
+# expect: second migrate: 0
+# expect: version: 1
+# expect: tables: lam_jobs_t1_health,lam_jobs_t1_instances,lam_jobs_t1_leases,lam_jobs_t1_queue,lam_jobs_t1_schedules,lam_jobs_t1_schema_version
+# expect: concurrent ok: 8 applied total: 1
+# expect: concurrent version: 1
+# expect: other prefix untouched: 1 1
+# expect: ensureSchema: true
+# expect: dropped: 0 tables left: 0
+
+from @lam/jobs import Jobs, JobsRow
+from lamerrors import Result
+from lamdb import Db
+from lamconcurrency import Atomic, WaitGroup
+from lamenv import Env
+
+async func migrateAsync(db: Db, prefix: str, okCount: Atomic, applied: Atomic, group: WaitGroup) {
+    r: Result[int] = Jobs.migrate(db, prefix)
+    if r.ok() {
+        _ = okCount.increment()
+        _ = applied.add(r.unwrap())
+    } else {
+        print(f"migrate failed: {r.error}")
+    }
+    group.done()
+}
+
+func tableNames(db: Db, prefix: str) -> Result[str] {
+    rows: list[dict[str, any]] = db.query("SELECT string_agg(table_name, ',' ORDER BY table_name) AS names FROM information_schema.tables WHERE table_schema = current_schema() AND table_name LIKE ?", [prefix + "%"])?
+    return Result.Ok(JobsRow.str(rows[0], "names"))
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        _ = db.setPool(20, 10, 60, 600)?
+        p1: str = "lam_jobs_t1_"
+        p2: str = "lam_jobs_t2_"
+        _ = Jobs.dropSchema(db, p1)?
+        _ = Jobs.dropSchema(db, p2)?
+        print(f"before: {Jobs.schemaVersion(db, p1)?}")
+        print(f"first migrate: {Jobs.migrate(db, p1)?}")
+        print(f"second migrate: {Jobs.migrate(db, p1)?}")
+        print(f"version: {Jobs.schemaVersion(db, p1)?}")
+        print(f"tables: {tableNames(db, p1)?}")
+
+        okCount: Atomic = Atomic(0)
+        applied: Atomic = Atomic(0)
+        group: WaitGroup = WaitGroup()
+        for i in range(8) {
+            group.add(1)
+            _ = migrateAsync(db, p2, okCount, applied, group)
+        }
+        group.wait()
+        print(f"concurrent ok: {okCount.get()} applied total: {applied.get()}")
+        print(f"concurrent version: {Jobs.schemaVersion(db, p2)?}")
+        _ = Jobs.dropSchema(db, p2)?
+        names: str = tableNames(db, p1)?
+        print(f"other prefix untouched: {Jobs.schemaVersion(db, p1)?} {len(names.split(',')) // 6}")
+        print(f"ensureSchema: {Jobs.ensureSchema(db, p1)?}")
+        _ = Jobs.dropSchema(db, p1)?
+        left: str = tableNames(db, p1)?
+        print(f"dropped: {Jobs.schemaVersion(db, p1)?} tables left: {len(left)}")
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

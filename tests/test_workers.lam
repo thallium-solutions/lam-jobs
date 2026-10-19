@@ -1,0 +1,204 @@
+# Test: @lam/jobs JobWorkers — background pool processing, retries with
+# backoff, permanent errors, exceptions, per-job timeouts, lease renewal
+# for long jobs (no double run while two pools compete), LISTEN/NOTIFY
+# wake-ups versus the polling fallback, synchronous runOnce/drain, and
+# graceful stop with drain.
+#
+# requires: database
+# expect: pool processed: 20 completed=20 concurrent max>1: true
+# expect: stop drained: true loops idle: 0
+# expect: retried then done: done attempt=2
+# expect: permanent: dead attempt=1 error=bad payload
+# expect: exception: dead attempt=2 error mentions exploded: true
+# expect: timeout: dead error=job timed out after 1 s
+# expect: long job with renewal: done runs=1 attempt=1
+# expect: notify wake fast: true notifications>=1: true
+# expect: polling fallback: true
+# expect: runOnce: 3 drain: 4 left 0
+# expect: graceful stop waited: true state=done
+# expect: drain timeout: false
+
+from @lam/jobs import Jobs, JobQueue, QueuedJob, QueueStats, JobWorkers, JobBackoff
+from lamerrors import Result, Error
+from lamdb import Db
+from lamenv import Env
+from lamtime import Time
+from lamconcurrency import Atomic
+
+class Handler {
+    func init(self) {
+        self.calls: Atomic = Atomic(0)
+        self.active: Atomic = Atomic(0)
+        self.maxActive: Atomic = Atomic(0)
+        self.longRuns: Atomic = Atomic(0)
+    }
+
+    func handle(self, job: QueuedJob) -> Result[bool] {
+        _ = self.calls.increment()
+        now: int = self.active.increment()
+        while true {
+            seen: int = self.maxActive.get()
+            if now <= seen or self.maxActive.compareAndSwap(seen, now) {
+                break
+            }
+        }
+        out: Result[bool] = self.dispatch(job)
+        _ = self.active.decrement()
+        return out
+    }
+
+    func dispatch(self, job: QueuedJob) -> Result[bool] {
+        kind: str = job.payload.kind
+        if kind == "ok" {
+            Time.sleepMs(20)
+            return Result.Ok(true)
+        }
+        if kind == "fail-once" {
+            if job.attempt == 1 {
+                return Result.Err(Error("Flaky", "first attempt fails"))
+            }
+            return Result.Ok(true)
+        }
+        if kind == "permanent" {
+            return Result.Err(JobQueue.permanent("bad payload"))
+        }
+        if kind == "throw" {
+            throw ValueError("exploded")
+        }
+        if kind == "slow" {
+            Time.sleepMs(2500)
+            return Result.Ok(true)
+        }
+        if kind == "long" {
+            _ = self.longRuns.increment()
+            Time.sleepMs(4500)
+            return Result.Ok(true)
+        }
+        if kind == "sleep" {
+            Time.sleepMs(1500)
+            return Result.Ok(true)
+        }
+        return Result.Ok(true)
+    }
+}
+
+func waitDone(q: JobQueue, done: int, ms: int) -> Result[bool] {
+    waited: int = 0
+    while waited < ms {
+        s: QueueStats = q.stats()?
+        if s.done + s.dead >= done {
+            return Result.Ok(true)
+        }
+        Time.sleepMs(25)
+        waited += 25
+    }
+    return Result.Ok(false)
+}
+
+func main() {
+    do {
+        url: str = Env.getOr("LAM_JOBS_TEST_DATABASE_URL", "")
+        db: Db = Db.connect("postgres", url)?
+        _ = db.setPool(30, 10, 60, 600)?
+        prefix: str = "lam_jobs_work_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        h: Handler = Handler()
+        q: JobQueue = JobQueue(db, "pool", "p1", prefix).withBackoff(JobBackoff(0, 0, 0.0)).withMaxAttempts(2)
+
+        pool: JobWorkers = JobWorkers(q, h.handle, 4).withLease(3).withPollInterval(100).quiet()
+        pool.start()
+        for i in range(20) {
+            _ = q.enqueue({"kind": "ok", "i": i})?
+        }
+        finished: bool = waitDone(q, 20, 15000)?
+        s: QueueStats = q.stats()?
+        print(f"pool processed: {s.done} completed={pool.completedCount()} concurrent max>1: {h.maxActive.get() > 1 and finished}")
+
+        retryId: int = q.enqueue({"kind": "fail-once"})?
+        permanentId: int = q.enqueue({"kind": "permanent"})?
+        throwId: int = q.enqueue({"kind": "throw"})?
+        _ = waitDone(q, 23, 15000)?
+        drained: bool = pool.stop()
+        print(f"stop drained: {drained} loops idle: {pool.activeCount()}")
+        r: QueuedJob = q.get(retryId)?
+        print(f"retried then done: {r.state} attempt={r.attempt}")
+        p: QueuedJob = q.get(permanentId)?
+        print(f"permanent: {p.state} attempt={p.attempt} error={p.lastError}")
+        t: QueuedJob = q.get(throwId)?
+        print(f"exception: {t.state} attempt={t.attempt} error mentions exploded: {t.lastError.contains('exploded')}")
+
+        tq: JobQueue = JobQueue(db, "timeouts", "t1", prefix).withMaxAttempts(1)
+        timed: JobWorkers = JobWorkers(tq, h.handle, 1).withTimeout(1).quiet()
+        slowId: int = tq.enqueue({"kind": "slow"})?
+        _ = timed.runOnce()?
+        slow: QueuedJob = tq.get(slowId)?
+        print(f"timeout: {slow.state} error={slow.lastError}")
+
+        lq: JobQueue = JobQueue(db, "long", "l1", prefix)
+        lq2: JobQueue = JobQueue(db, "long", "l2", prefix)
+        poolA: JobWorkers = JobWorkers(lq, h.handle, 2).withLease(3).withPollInterval(100).quiet()
+        poolB: JobWorkers = JobWorkers(lq2, h.handle, 2).withLease(3).withPollInterval(100).quiet()
+        longId: int = lq.enqueue({"kind": "long"})?
+        poolA.start()
+        Time.sleepMs(300)
+        poolB.start()
+        _ = waitDone(lq, 1, 15000)?
+        _ = poolA.stop()
+        _ = poolB.stop()
+        long: QueuedJob = lq.get(longId)?
+        print(f"long job with renewal: {long.state} runs={h.longRuns.get()} attempt={long.attempt}")
+
+        nq: JobQueue = JobQueue(db, "notify", "n1", prefix)
+        producer: JobQueue = JobQueue(db, "notify", "producer", prefix)
+        listening: JobWorkers = JobWorkers(nq, h.handle, 1).withPollInterval(30000).quiet()
+        _ = listening.listen()?
+        listening.start()
+        Time.sleepMs(300)
+        started: int = Time.nowUnixMilli()
+        _ = producer.enqueue({"kind": "ok"})?
+        fast: bool = waitDone(nq, 1, 5000)?
+        elapsed: int = Time.nowUnixMilli() - started
+        print(f"notify wake fast: {fast and elapsed < 3000} notifications>=1: {listening.notifications() >= 1}")
+        _ = listening.stop()
+
+        pq: JobQueue = JobQueue(db, "polling", "q1", prefix)
+        pproducer: JobQueue = JobQueue(db, "polling", "producer", prefix).withNotify(false)
+        polling: JobWorkers = JobWorkers(pq, h.handle, 1).withPollInterval(200).quiet()
+        polling.start()
+        Time.sleepMs(100)
+        _ = pproducer.enqueue({"kind": "ok"})?
+        polled: bool = waitDone(pq, 1, 3000)?
+        print(f"polling fallback: {polled}")
+        _ = polling.stop()
+
+        sq: JobQueue = JobQueue(db, "sync", "s1", prefix)
+        for i in range(7) {
+            _ = sq.enqueue({"kind": "ok"})?
+        }
+        syncWorkers: JobWorkers = JobWorkers(sq, h.handle, 3).quiet()
+        once: int = syncWorkers.runOnce()?
+        rest: int = syncWorkers.drain()?
+        leftStats: QueueStats = sq.stats()?
+        print(f"runOnce: {once} drain: {rest} left {leftStats.pending}")
+
+        gq: JobQueue = JobQueue(db, "graceful", "g1", prefix)
+        graceful: JobWorkers = JobWorkers(gq, h.handle, 1).withPollInterval(50).quiet()
+        sleepId: int = gq.enqueue({"kind": "sleep"})?
+        graceful.start()
+        Time.sleepMs(400)
+        waitedOk: bool = graceful.stop()
+        sleeper: QueuedJob = gq.get(sleepId)?
+        print(f"graceful stop waited: {waitedOk} state={sleeper.state}")
+
+        hurried: JobWorkers = JobWorkers(gq, h.handle, 1).withPollInterval(50).withDrainTimeout(1).quiet()
+        _ = gq.enqueue({"kind": "long"})?
+        hurried.start()
+        Time.sleepMs(400)
+        print(f"drain timeout: {hurried.stop()}")
+        Time.sleepMs(4500)
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}

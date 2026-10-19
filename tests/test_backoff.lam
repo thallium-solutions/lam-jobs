@@ -1,0 +1,45 @@
+# Test: @lam/jobs JobBackoff — doubling delays, the cap, jitter bounds,
+# deterministic jitter, immediate retries, and argument clamping.
+#
+# expect: webhook schedule: [30 60 120 240 480 960 1920 3840 7680 15360 21600 21600]
+# expect: mail schedule: [60 120 240 480 960 1920 3840]
+# expect: replication cap: [30 60 120 240 480 960 1920 3600 3600]
+# expect: jitter bounds ok: true
+# expect: jitter spreads: true
+# expect: delayWith: 30 27 29 5400 21600
+# expect: no jitter: 120 120
+# expect: immediate: [0 0 0]
+# expect: clamped jitter: 1 0 30
+# expect: huge attempt: 21600
+
+from @lam/jobs import JobBackoff
+
+func main() {
+    webhook: JobBackoff = JobBackoff(30, 21600, 0.1)
+    print(f"webhook schedule: {webhook.schedule(12)}")
+    mail: JobBackoff = JobBackoff(60, 3840, 0.0)
+    print(f"mail schedule: {mail.schedule(7)}")
+    replication: JobBackoff = JobBackoff(30, 3600, 0.0)
+    print(f"replication cap: {replication.schedule(9)}")
+
+    ok: bool = true
+    seen: dict[int, bool] = {}
+    for i in range(200) {
+        d: int = webhook.delay(3)
+        seen[d] = true
+        if d < 108 or d > 120 {
+            ok = false
+        }
+    }
+    print(f"jitter bounds ok: {ok}")
+    print(f"jitter spreads: {len(seen) > 1}")
+
+    print(f"delayWith: {webhook.delayWith(1, 0.0)} {webhook.delayWith(1, 1.0)} {webhook.delayWith(1, 0.5)} {JobBackoff(30, 21600, 0.75).delayWith(20, 1.0)} {webhook.delayWith(40, -3.0)}")
+    flat: JobBackoff = JobBackoff(30, 21600, 0.0)
+    print(f"no jitter: {flat.delay(3)} {flat.delay(3)}")
+    now: JobBackoff = JobBackoff(0, 100, 0.5)
+    print(f"immediate: {now.schedule(3)}")
+    clamped: JobBackoff = JobBackoff(30, 21600, 7.5)
+    print(f"clamped jitter: {int(clamped.jitter)} {clamped.delayWith(1, 1.0)} {JobBackoff(30, 21600, -1.0).delayWith(1, 1.0)}")
+    print(f"huge attempt: {webhook.ceiling(1000000)}")
+}

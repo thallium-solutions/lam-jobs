@@ -1,0 +1,166 @@
+# Copyright 2026 Thallium Solutions di Busconi Alessandro.
+# SPDX-License-Identifier: Apache-2.0
+#
+# @lam/jobs — named, expiring leases shared by every instance through
+# PostgreSQL (table ``<prefix>leases``). Expiry uses the database clock.
+
+from lamdb import Db
+from lamerrors import Result, Error
+from .schema import Jobs, JobsRow, JobsDefaultPrefix
+from .keeper import JobsKeeper
+
+#- A lease row. ``owner`` is "" and ``held`` false when the lease is free
+   or expired. ``fence`` increases every time the lease changes hands: pass
+   it to downstream systems to reject writes from a stale holder. -#
+class JobLease {
+    func init(self, name: str) {
+        self.name: str = name
+        self.owner: str = ""
+        self.fence: int = 0
+        self.acquiredAt: int = 0
+        self.expiresAt: int = 0
+        self.remainingSeconds: int = 0
+        self.held: bool = false
+    }
+
+    static func fromRow(row: dict[str, any]) -> JobLease {
+        info: JobLease = JobLease(JobsRow.str(row, "name"))
+        info.fence = JobsRow.int(row, "fence")
+        info.acquiredAt = JobsRow.int(row, "acquired_at")
+        info.expiresAt = JobsRow.int(row, "expires_at")
+        info.remainingSeconds = JobsRow.int(row, "remaining")
+        info.held = JobsRow.bool(row, "live")
+        if info.held {
+            info.owner = JobsRow.str(row, "owner")
+        } else {
+            info.remainingSeconds = 0
+        }
+        return info
+    }
+
+    func __json__(self) -> json {
+        return {"name": self.name, "owner": self.owner, "fence": self.fence, "acquiredAt": self.acquiredAt, "expiresAt": self.expiresAt, "remainingSeconds": self.remainingSeconds, "held": self.held}
+    }
+}
+
+#- Distributed leases owned by ``owner`` (default: a unique
+   ``host:pid:random`` id). A lease is held until it expires, is released,
+   or is renewed by its owner; any other owner can take it once expired. -#
+class JobLeases {
+    func init(self, db: Db, owner: str = "", prefix: str = JobsDefaultPrefix) {
+        Jobs.requirePrefix(prefix)
+        self.db: Db = db
+        self.owner: str = owner if owner != "" else Jobs.newOwner()
+        self.prefix: str = prefix
+        self.table: str = prefix + "leases"
+    }
+
+    #- Takes ``name`` for ``ttlSeconds`` when it is free, expired, or already
+       ours (then it is extended). ``Ok(false)`` when another owner holds
+       it. -#
+    func acquire(self, name: str, ttlSeconds: int) -> Result[bool] {
+        if ttlSeconds <= 0 {
+            return Result.Err(Error("JobsConfigError", "lease ttlSeconds must be positive"))
+        }
+        t: str = self.table
+        rows: list[dict[str, any]] = self.db.query(f"INSERT INTO {t} (name, owner, fence, acquired_at, expires_at) VALUES (?, ?, 1, now(), now() + make_interval(secs => ?)) ON CONFLICT (name) DO UPDATE SET fence = CASE WHEN {t}.owner = EXCLUDED.owner AND {t}.expires_at > now() THEN {t}.fence ELSE {t}.fence + 1 END, acquired_at = CASE WHEN {t}.owner = EXCLUDED.owner AND {t}.expires_at > now() THEN {t}.acquired_at ELSE now() END, owner = EXCLUDED.owner, expires_at = EXCLUDED.expires_at WHERE {t}.expires_at <= now() OR {t}.owner = EXCLUDED.owner RETURNING fence", [name, self.owner, ttlSeconds])?
+        return Result.Ok(len(rows) > 0)
+    }
+
+    #- Extends a lease we hold; ``Ok(false)`` when it expired and another
+       owner took it or was released. -#
+    func renew(self, name: str, ttlSeconds: int) -> Result[bool] {
+        if ttlSeconds <= 0 {
+            return Result.Err(Error("JobsConfigError", "lease ttlSeconds must be positive"))
+        }
+        n: int = self.db.exec(f"UPDATE {self.table} SET expires_at = now() + make_interval(secs => ?) WHERE name = ? AND owner = ? AND expires_at > now()", [ttlSeconds, name, self.owner])?
+        return Result.Ok(n > 0)
+    }
+
+    #- Gives a lease back at once; ``Ok(false)`` when we did not hold it.
+       The row stays (expired) so the next holder's ``fence`` keeps
+       increasing. -#
+    func release(self, name: str) -> Result[bool] {
+        n: int = self.db.exec(f"UPDATE {self.table} SET expires_at = now() WHERE name = ? AND owner = ? AND expires_at > now()", [name, self.owner])?
+        return Result.Ok(n > 0)
+    }
+
+    #- The current holder of ``name``, "" when free or expired. -#
+    func holder(self, name: str) -> Result[str] {
+        info: JobLease = self.info(name)?
+        return Result.Ok(info.owner)
+    }
+
+    #- True when we hold ``name`` (and it has not expired). -#
+    func holds(self, name: str) -> Result[bool] {
+        info: JobLease = self.info(name)?
+        return Result.Ok(info.held and info.owner == self.owner)
+    }
+
+    #- The lease row of ``name`` (``held`` false when free or expired). -#
+    func info(self, name: str) -> Result[JobLease] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT name, owner, fence, EXTRACT(EPOCH FROM acquired_at)::bigint AS acquired_at, EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at, GREATEST(0, CEIL(EXTRACT(EPOCH FROM expires_at - now())))::bigint AS remaining, expires_at > now() AS live FROM {self.table} WHERE name = ?", [name])?
+        if len(rows) == 0 {
+            return Result.Ok(JobLease(name))
+        }
+        return Result.Ok(JobLease.fromRow(rows[0]))
+    }
+
+    #- Every lease row, live or expired, by name. -#
+    func list(self) -> Result[list[JobLease]] {
+        rows: list[dict[str, any]] = self.db.query(f"SELECT name, owner, fence, EXTRACT(EPOCH FROM acquired_at)::bigint AS acquired_at, EXTRACT(EPOCH FROM expires_at)::bigint AS expires_at, GREATEST(0, CEIL(EXTRACT(EPOCH FROM expires_at - now())))::bigint AS remaining, expires_at > now() AS live FROM {self.table} ORDER BY name", [])?
+        out: list[JobLease] = []
+        for row in rows {
+            out.append(JobLease.fromRow(row))
+        }
+        return Result.Ok(out)
+    }
+
+    #- Deletes leases that expired more than ``olderThanSeconds`` ago. The
+       fence of a pruned lease starts again at 1: prune only leases whose
+       fencing tokens no downstream system still compares. -#
+    func prune(self, olderThanSeconds: int) -> Result[int] {
+        return self.db.exec(f"DELETE FROM {self.table} WHERE expires_at < now() - make_interval(secs => ?)", [olderThanSeconds])
+    }
+
+    func renewQuietly(self, name: str, ttlSeconds: int) -> bool {
+        r: Result[bool] = self.renew(name, ttlSeconds)
+        if not r.ok() {
+            # Transient database error: keep trying until the lease expires.
+            return true
+        }
+        return r.unwrap()
+    }
+
+    #- Distributed singleton: runs ``fn`` only if ``name`` can be acquired,
+       renewing the lease every ``ttlSeconds / 3`` while ``fn`` runs and
+       releasing it afterwards. ``Ok(false)``: another instance holds it;
+       ``Ok(true)``: ``fn`` ran and succeeded; ``fn``'s error otherwise. -#
+    func runExclusive(self, name: str, ttlSeconds: int, fn: func() -> Result[int]) -> Result[bool] {
+        acquired: bool = self.acquire(name, ttlSeconds)?
+        if not acquired {
+            return Result.Ok(false)
+        }
+        leases: JobLeases = self
+        keeper: JobsKeeper = JobsKeeper(ttlSeconds * 1000 // 3, lambda() -> bool: leases.renewQuietly(name, ttlSeconds))
+        keeper.start()
+        outcome: Result[int] = Result.Ok(0)
+        try {
+            outcome = fn()
+        } catch err {
+            keeper.stop()
+            _ = self.release(name)
+            throw err
+        }
+        keeper.stop()
+        _ = self.release(name)
+        if not outcome.ok() {
+            return Result.Err(outcome.error)
+        }
+        return Result.Ok(true)
+    }
+}
+
+func main() {
+    pass
+}

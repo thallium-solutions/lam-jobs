@@ -1,0 +1,222 @@
+# Test: @lam/jobs JobQueue — enqueue (payload round-trip, priorities,
+# delays, unique keys), claim order and limits, queue isolation, complete,
+# fail with backoff, retry, dead letters after max attempts, bury,
+# retryDead, cancel/cancelKey, lease extension, expired-claim recovery
+# (including on the last attempt), stale workers losing their claim,
+# enqueue inside a caller's transaction (rollback and commit), stats, lag,
+# gauges, statsAll, list and purge.
+#
+# requires: database
+# expect: payload: {"event":"file.uploaded","n":1,"tags":["a","b"]}
+# expect: claim order: high,first,second then none
+# expect: delayed hidden: scheduled=1
+# expect: unique: true 0 true
+# expect: isolated: other queue claims 1, webhooks claims 0
+# expect: complete: true again false state done
+# expect: fail: pending attempt=1 delay ok=true failed=1
+# expect: not due yet: 0
+# expect: retry now: true attempt=2
+# expect: dead after max: dead error=still failing
+# expect: dead list: 1 retryDead: 1 attempt restarts: 1
+# expect: bury: dead
+# expect: retryAfter 0: pending claimable=1
+# expect: cancel: true false false
+# expect: cancelKey: true
+# expect: extend: true lease ok=true
+# expect: recovered by other worker: attempt=2 error=lease expired: w1 did not finish the job
+# expect: stale complete: false fresh complete: true
+# expect: stale fail: ''
+# expect: last attempt lease expiry: dead
+# expect: tx rollback: 0 jobs
+# expect: tx commit: 1 job, business rows 1
+# expect: lag >= 120: true
+# expect: stats: pending=1 running=0 failed=0 dead=2 done=9 cancelled=4
+# expect: gauges: queue_webhooks_dead=2 queue_webhooks_pending=1
+# expect: statsAll: other-queue,webhooks
+# expect: list dead: 2 newest first: true
+# expect: purged: 15 left: 1
+# expect: bad claim: JobsConfigError
+# expect: not found: JobsNotFound
+
+from @lam/jobs import Jobs, JobsRow, JobQueue, QueuedJob, QueueStats, JobBackoff
+from lamerrors import Result
+from lamdb import Db, Tx
+from lamenv import Env
+from lamtime import Time
+
+func one(q: JobQueue, lease: int) -> Result[QueuedJob] {
+    jobs: list[QueuedJob] = q.claim(1, lease)?
+    if len(jobs) == 0 {
+        return Result.Ok(QueuedJob(0, ""))
+    }
+    return Result.Ok(jobs[0])
+}
+
+func label(job: QueuedJob) -> str {
+    if job.id == 0 {
+        return "none"
+    }
+    name: str = job.payload.name
+    return name
+}
+
+func dbNow(db: Db) -> Result[int] {
+    rows: list[dict[str, any]] = db.query("SELECT EXTRACT(EPOCH FROM now())::bigint AS t", [])?
+    return Result.Ok(JobsRow.int(rows[0], "t"))
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_queue_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        q: JobQueue = JobQueue(db, "webhooks", "w1", prefix).withBackoff(JobBackoff(60, 3600, 0.0))
+        other: JobQueue = JobQueue(db, "other-queue", "o1", prefix)
+
+        id: int = q.enqueue({"event": "file.uploaded", "n": 1, "tags": ["a", "b"]})?
+        job: QueuedJob = q.get(id)?
+        print(f"payload: {job.payload}")
+        _ = q.cancel(id)?
+
+        _ = q.enqueue({"name": "first"})?
+        _ = q.enqueue({"name": "high"}, 0, 5)?
+        _ = q.enqueue({"name": "second"})?
+        now: int = dbNow(db)?
+        delayedId: int = q.enqueue({"name": "delayed"}, now + 3600)?
+        a: QueuedJob = one(q, 60)?
+        b: QueuedJob = one(q, 60)?
+        c: QueuedJob = one(q, 60)?
+        d: QueuedJob = one(q, 60)?
+        print(f"claim order: {label(a)},{label(b)},{label(c)} then {label(d)}")
+        s: QueueStats = q.stats()?
+        print(f"delayed hidden: scheduled={s.scheduled}")
+        _ = q.complete(a)?
+        _ = q.complete(b)?
+        _ = q.cancel(delayedId)?
+
+        first: int = q.enqueue({"name": "u"}, 0, 0, "evt-1")?
+        dup: int = q.enqueue({"name": "u"}, 0, 0, "evt-1")?
+        u: QueuedJob = one(q, 60)?
+        _ = q.complete(u)?
+        again: int = q.enqueue({"name": "u2"}, 0, 0, "evt-1")?
+        print(f"unique: {first > 0} {dup} {again > 0}")
+
+        _ = other.enqueue({"name": "o"})?
+        otherJobs: list[QueuedJob] = other.claim(5, 60)?
+        _ = other.complete(otherJobs[0])?
+        nothing: list[QueuedJob] = q.claim(5, 60)?
+        # the u2 job is due on webhooks: claim it and complete it.
+        print(f"isolated: other queue claims {len(otherJobs)}, webhooks claims {len(nothing) - 1}")
+        _ = q.complete(nothing[0])?
+
+        completed: bool = q.complete(c)?
+        completedAgain: bool = q.complete(c)?
+        cState: QueuedJob = q.get(c.id)?
+        print(f"complete: {completed} again {completedAgain} state {cState.state}")
+
+        flaky: int = q.enqueue({"name": "flaky"}, 0, 0, "", 2)?
+        f1: QueuedJob = one(q, 60)?
+        state: str = q.fail(f1, "connection refused")?
+        f1 = q.get(flaky)?
+        now = dbNow(db)?
+        s = q.stats()?
+        print(f"fail: {state} attempt={f1.attempt} delay ok={f1.runAt - now >= 58 and f1.runAt - now <= 60} failed={s.failed}")
+        notDue: list[QueuedJob] = q.claim(5, 60)?
+        print(f"not due yet: {len(notDue)}")
+        retried: bool = q.retry(flaky)?
+        f2: QueuedJob = one(q, 60)?
+        print(f"retry now: {retried} attempt={f2.attempt}")
+        state = q.fail(f2, "still failing")?
+        f2 = q.get(flaky)?
+        print(f"dead after max: {state} error={f2.lastError}")
+        deadJobs: list[QueuedJob] = q.dead()?
+        revived: int = q.retryDead()?
+        f3: QueuedJob = one(q, 60)?
+        print(f"dead list: {len(deadJobs)} retryDead: {revived} attempt restarts: {f3.attempt}")
+        print(f"bury: {q.bury(f3, 'invalid payload')?}")
+
+        _ = q.enqueue({"name": "quick"})?
+        quick: QueuedJob = one(q, 60)?
+        quickState: str = q.fail(quick, "transient", 0)?
+        quickAgain: list[QueuedJob] = q.claim(5, 60)?
+        print(f"retryAfter 0: {quickState} claimable={len(quickAgain)}")
+        _ = q.complete(quickAgain[0])?
+
+        pendingId: int = q.enqueue({"name": "to-cancel"}, now + 600)?
+        cancelled: bool = q.cancel(pendingId)?
+        cancelledAgain: bool = q.cancel(pendingId)?
+        _ = q.enqueue({"name": "running"})?
+        running: QueuedJob = one(q, 60)?
+        print(f"cancel: {cancelled} {cancelledAgain} {q.cancel(running.id)?}")
+        _ = q.complete(running)?
+        _ = q.enqueue({"name": "keyed"}, now + 600, 0, "k-cancel")?
+        print(f"cancelKey: {q.cancelKey('k-cancel')?}")
+
+        _ = q.enqueue({"name": "long"})?
+        long: QueuedJob = one(q, 2)?
+        extended: bool = q.extend(long, 30)?
+        long = q.get(long.id)?
+        now = dbNow(db)?
+        print(f"extend: {extended} lease ok={long.lockedUntil - now >= 28}")
+        _ = q.complete(long)?
+
+        w2: JobQueue = JobQueue(db, "webhooks", "w2", prefix)
+        _ = q.enqueue({"name": "crash"})?
+        lost: QueuedJob = one(q, 1)?
+        Time.sleepMs(1300)
+        taken: QueuedJob = one(w2, 60)?
+        print(f"recovered by other worker: attempt={taken.attempt} error={taken.lastError}")
+        staleDone: bool = q.complete(lost)?
+        freshDone: bool = w2.complete(taken)?
+        print(f"stale complete: {staleDone} fresh complete: {freshDone}")
+        staleFail: str = q.fail(lost, "late")?
+        print(f"stale fail: '{staleFail}'")
+
+        lastId: int = q.enqueue({"name": "last"}, 0, 0, "", 1)?
+        _ = one(q, 1)?
+        Time.sleepMs(1300)
+        _ = w2.recoverExpired()?
+        last: QueuedJob = q.get(lastId)?
+        print(f"last attempt lease expiry: {last.state}")
+
+        _ = db.exec(f"DROP TABLE IF EXISTS {prefix}business", [])?
+        _ = db.exec(f"CREATE TABLE {prefix}business (id SERIAL PRIMARY KEY, note TEXT)", [])?
+        tx: Tx = db.begin()?
+        _ = tx.exec(f"INSERT INTO {prefix}business (note) VALUES (?)", ["rolled back"])?
+        _ = q.enqueueIn(tx, {"name": "in-tx"})?
+        _ = tx.rollback()?
+        rolled: list[QueuedJob] = q.list("pending")?
+        print(f"tx rollback: {len(rolled)} jobs")
+        tx2: Tx = db.begin()?
+        _ = tx2.exec(f"INSERT INTO {prefix}business (note) VALUES (?)", ["committed"])?
+        _ = q.enqueueIn(tx2, {"name": "in-tx"}, now - 120)?
+        _ = tx2.commit()?
+        committed: list[QueuedJob] = q.list("pending")?
+        business: list[dict[str, any]] = db.query(f"SELECT COUNT(*)::bigint AS n FROM {prefix}business", [])?
+        print(f"tx commit: {len(committed)} job, business rows {JobsRow.int(business[0], 'n')}")
+
+        s = q.stats()?
+        print(f"lag >= 120: {s.lagSeconds >= 120}")
+        print(f"stats: pending={s.pending} running={s.running} failed={s.failed} dead={s.dead} done={s.done} cancelled={s.cancelled}")
+        g: dict[str, int] = q.gauges()?
+        print(f"gauges: queue_webhooks_dead={g['queue_webhooks_dead']} queue_webhooks_pending={g['queue_webhooks_pending']}")
+        all: dict[str, QueueStats] = JobQueue.statsAll(db, prefix)?
+        queueNames: list[str] = [k for k in all]
+        queueNames = queueNames.sort()
+        print(f"statsAll: {','.join(queueNames)}")
+        deadNow: list[QueuedJob] = q.list("dead", 10)?
+        print(f"list dead: {len(deadNow)} newest first: {deadNow[0].id > deadNow[1].id}")
+        purged: int = q.purge(0)?
+        left: list[QueuedJob] = q.list()?
+        print(f"purged: {purged} left: {len(left)}")
+        bad: Result[list[QueuedJob]] = q.claim(0, 60)
+        print(f"bad claim: {bad.error.kind}")
+        missing: Result[QueuedJob] = q.get(999999)
+        print(f"not found: {missing.error.kind}")
+        _ = db.exec(f"DROP TABLE {prefix}business", [])?
+        _ = Jobs.dropSchema(db, prefix)?
+    } catch err {
+        print(f"unexpected error: {err}")
+    }
+}
