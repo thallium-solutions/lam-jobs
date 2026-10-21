@@ -39,7 +39,7 @@ built only on PostgreSQL features: row locks, `ON CONFLICT`,
 
 ## Requirements
 
-- `lamc` 2.1 or newer (`>=2.1, <4`).
+- `lamc` 3.0 or newer (`>=3.0, <4`).
 - PostgreSQL 12 or newer (tested with 16). Other `lamdb` drivers are refused
   with `JobsConfigError`.
 - No Go modules beyond those already linked by the standard library: the
@@ -52,13 +52,13 @@ Add the dependency to your `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/jobs" = { git = "https://github.com/thallium-solutions/lam-jobs.git", ref = "1.0.0" }
+"@lam/jobs" = { git = "https://github.com/thallium-solutions/lam-jobs.git", ref = "1.0.1" }
 ```
 
 or install it directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-jobs.git@1.0.0
+lamc install https://github.com/thallium-solutions/lam-jobs.git@1.0.1
 ```
 
 and import what you need:
@@ -436,11 +436,8 @@ func metrics(db: Db) -> Result[dict[str, int]] {
 ```
 
 `JobStatus`, `JobSchedule`, `InstanceInfo`, `QueuedJob`, `QueueStats` and
-`JobLease` implement `__json__`. With `lamc` 2.1, `json(value)` and other
-`json`-typed uses need the class imported from its module (for example
-`from @lam/jobs/health import JobStatus`, `from @lam/jobs/queue import
-QueueStats`): classes re-exported by the package root lose their member
-types in the semantic checker. For the same reason, read payload fields into
+`JobLease` implement `__json__`, so they can be used directly in `json`
+values.
 typed locals (`to: str = job.payload.to`) before passing them on.
 
 ## Operations notes
@@ -489,7 +486,7 @@ python3 tests/run_lamjobs_tests.py --verbose
 sh test-services.sh --stop
 ```
 
-The runner needs `lamc >= 2.1.0` on `PATH`, stages this checkout as
+The runner needs `lamc >= 3.0.0` on `PATH`, stages this checkout as
 `extlibs/@lam/jobs` in a temporary tree (the installed-package boundary),
 compiles every `tests/test_*.lam` without caches and compares its output
 with the `# expect:` lines. Tests marked `# requires: database` are reported

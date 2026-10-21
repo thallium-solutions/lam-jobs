@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/jobs` are documented in this file.
 
+## [1.0.1] - 2026-10-21
+
+### Changed
+
+- Requires `lamc` 3.0 (`>=3.0, <4`). Classes re-exported by `@lam/jobs` keep their member types (no module imports needed for `json` values); workarounds for lamc 2.1 removed from `cron.lam` and the tests.
+
 ## [1.0.0] - 2026-10-19
 
 First release, extracted and generalised from the managed-file-transfer

@@ -124,8 +124,7 @@ const JobsSchemaVersion: int = 1
 
 #- Both ``lamdb.Db`` and ``lamdb.Tx`` satisfy this interface, so
    ``JobQueue.enqueueIn``/``completeIn`` can write inside the caller's
-   transaction. Calls through the interface always pass ``params``
-   (lamc 2.1 does not fill interface default arguments). -#
+   transaction. -#
 interface JobsSql {
     func exec(query: str, params: list[any] = []) -> Result[int]
     func query(query: str, params: list[any] = []) -> Result[list[dict[str, any]]]

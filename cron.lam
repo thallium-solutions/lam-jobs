@@ -185,10 +185,7 @@ class CronSchedule {
         doe: int = z - era * 146097
         yoe: int = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
         year: int = yoe + era * 400
-        # lamc 2.1.1 drops the parentheses of a parenthesised right operand of
-        # ``-`` (``a - (b + c)`` becomes ``a - b + c``): use a temporary.
-        yearStart: int = 365 * yoe + yoe // 4 - yoe // 100
-        doy: int = doe - yearStart
+        doy: int = doe - (365 * yoe + yoe // 4 - yoe // 100)
         mp: int = (5 * doy + 2) // 153
         day: int = doy - (153 * mp + 2) // 5 + 1
         month: int = mp + 3

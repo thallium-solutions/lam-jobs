@@ -22,10 +22,7 @@
 # expect: json: {"consecutiveFailures":0,"failures":3,"lastCount":7,"lastDurationMs":3,"lastError":"smtp down","name":"mail"}
 # expect: forget: true false
 
-from @lam/jobs import Jobs, JobHealth
-# JobStatus from its module: lamc 2.1 loses the method types of classes
-# re-exported by the package root, which json values need.
-from @lam/jobs/health import JobStatus
+from @lam/jobs import Jobs, JobHealth, JobStatus
 from lamerrors import Result, Error
 from lamdb import Db
 from lamenv import Env
@@ -40,16 +37,6 @@ func remoteFails() -> Result[int] {
 
 func explodes() -> Result[int] {
     throw ValueError("exploded")
-}
-
-# Outside the do block: lamc 2.1 cannot compile try/catch inside do/catch.
-func measureThrows(h: JobHealth) -> str {
-    try {
-        _ = h.measure("measured", explodes)
-    } catch ValueError as _ex {
-        return "ValueError"
-    }
-    return "none"
 }
 
 func names(items: list[JobStatus]) -> str {
@@ -89,7 +76,12 @@ func main() {
         e: Result[int] = h.measure("measured", remoteFails)
         m = h.get("measured")?
         print(f"measure err: {e.error.kind} recorded error {m.lastError}")
-        caught: str = measureThrows(h)
+        caught: str = "none"
+        try {
+            _ = h.measure("measured", explodes)
+        } catch ValueError as _ex {
+            caught = "ValueError"
+        }
         m = h.get("measured")?
         print(f"measure exception: {caught} consecutive {m.consecutiveFailures}")
 
