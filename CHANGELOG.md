@@ -2,6 +2,12 @@
 
 All notable changes to `@lam/jobs` are documented in this file.
 
+## [1.0.2] - 2026-11-03
+
+### Changed
+
+- Compatible with `lamc` 4.x: `compatibility.lamc = ">=3.0, <5"` (test runner too).
+
 ## [1.0.1] - 2026-10-21
 
 ### Changed

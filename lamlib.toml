@@ -1,6 +1,6 @@
 [library]
 name = "@lam/jobs"
-version = "1.0.1"
+version = "1.0.2"
 description = "PostgreSQL-backed leases, periodic and cron scheduling, job health, instance heartbeats and a durable job queue for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
@@ -8,7 +8,7 @@ repository = "https://github.com/thallium-solutions/lam-jobs"
 homepage = "https://github.com/thallium-solutions/lam-jobs"
 
 [compatibility]
-lamc = ">=3.0, <4"
+lamc = ">=3.0, <5"
 
 [scripts]
 test = "python3 tests/run_lamjobs_tests.py --verbose"

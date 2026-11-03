@@ -39,7 +39,7 @@ built only on PostgreSQL features: row locks, `ON CONFLICT`,
 
 ## Requirements
 
-- `lamc` 3.0 or newer (`>=3.0, <4`).
+- `lamc` 3.0 or newer (`>=3.0, <5`).
 - PostgreSQL 12 or newer (tested with 16). Other `lamdb` drivers are refused
   with `JobsConfigError`.
 - No Go modules beyond those already linked by the standard library: the
