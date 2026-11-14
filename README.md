@@ -52,13 +52,13 @@ Add the dependency to your `lamlib.toml`:
 
 ```toml
 [dependencies]
-"@lam/jobs" = { git = "https://github.com/thallium-solutions/lam-jobs.git", ref = "1.0.1" }
+"@lam/jobs" = { git = "https://github.com/thallium-solutions/lam-jobs.git", ref = "1.0.3" }
 ```
 
 or install it directly:
 
 ```bash
-lamc install https://github.com/thallium-solutions/lam-jobs.git@1.0.1
+lamc install https://github.com/thallium-solutions/lam-jobs.git@1.0.3
 ```
 
 and import what you need:

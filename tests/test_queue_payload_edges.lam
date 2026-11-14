@@ -1,0 +1,233 @@
+# Test: @lam/jobs JobQueue edge cases against a real PostgreSQL — payloads
+# (non-ASCII keys and values, nesting, a 200 000-character string, null and
+# boolean fields), negative priorities, non-ASCII unique keys, a single
+# attempt (`lastAttempt`, straight to dead), `completeIn` inside a rolled
+# back and a committed transaction, `purge` keeping dead jobs, schema
+# prefixes isolating queues, invalid prefixes, and worker counters
+# (`completedCount`/`failedCount`). Then a composed run: 40 jobs enqueued
+# from async tasks by a `Mailer` service class, drained by two worker
+# pools, outcomes checked with comprehensions, `?` and `do/catch`.
+#
+# requires: database
+# expect: unicode payload: Zoë 🦅 東京 [α β] {"ключ":"значение"}
+# expect: large payload: 200000 characters, 200000 bytes of ASCII
+# expect: null and booleans: true false null-present=true
+# expect: priority order: high,zero,negative
+# expect: unique non-ASCII key: true 0
+# expect: single attempt: last=true state=dead; three attempts: last=false
+# expect: completeIn: rollback keeps running=true, commit done=true
+# expect: purge keeps dead: purged=9 dead left=1
+# expect: prefixes isolate: a=1 b=0
+# expect: invalid prefix: false ValueError
+# expect: worker counters: completed=3 failed=2
+# expect: mailer: enqueued=40 unique ids=40 sent=40 by both pools=true
+# expect: mailer outbox: 40 messages, 4 domains
+# expect: missing job: JobsNotFound
+# expect: ok
+
+from @lam/jobs import Jobs, JobQueue, QueuedJob, QueueStats, JobWorkers, JobBackoff
+from lamerrors import Result, Error
+from lamdb import Db, Tx
+from lamenv import Env
+from lamjson import Json
+from lamconcurrency import Atomic, Mutex
+from lamtime import Time
+
+func one(q: JobQueue) -> Result[QueuedJob] {
+    jobs: list[QueuedJob] = q.claim(1, 60)?
+    if len(jobs) == 0 {
+        return Result.Err(Error("Empty", "nothing to claim"))
+    }
+    return Result.Ok(jobs[0])
+}
+
+class Counting {
+    func init(self) {
+        self.seen: Atomic = Atomic(0)
+    }
+
+    func handle(self, job: QueuedJob) -> Result[bool] {
+        _ = self.seen.increment()
+        if job.payload.fail == true {
+            return Result.Err(Error("Nope", "asked to fail"))
+        }
+        return Result.Ok(true)
+    }
+}
+
+class Mailer {
+    #- Enqueues e-mails and delivers them into an in-memory outbox. -#
+    func init(self, queue: JobQueue) {
+        self.queue: JobQueue = queue
+        self.lock: Mutex = Mutex()
+        self.outbox: list[str] = []
+        self.byOwner: dict[str, int] = {}
+    }
+
+    func send(self, to: str, subject: str) -> Result[int] {
+        return self.queue.enqueue({"to": to, "subject": subject}, 0, 0, f"mail:{to}:{subject}")
+    }
+
+    func deliver(self, job: QueuedJob) -> Result[bool] {
+        self.lock.lock()
+        defer self.lock.unlock()
+        to: str = job.payload.to
+        subject: str = job.payload.subject
+        self.outbox.append(f"{to}|{subject}")
+        self.byOwner[job.lockedBy] = (self.byOwner[job.lockedBy] if job.lockedBy in self.byOwner else 0) + 1
+        return Result.Ok(true)
+    }
+}
+
+async func sendTask(mailer: Mailer, i: int) -> Result[int] {
+    domain: str = ["example.com", "exämple.org", "例え.jp", "test.dev"][i % 4]
+    return mailer.send(f"user{i}@{domain}", f"Grüße #{i}")
+}
+
+func main() {
+    do {
+        db: Db = Db.connect("postgres", Env.getOr("LAM_JOBS_TEST_DATABASE_URL", ""))?
+        prefix: str = "lam_jobs_edges_"
+        _ = Jobs.dropSchema(db, prefix)?
+        _ = Jobs.migrate(db, prefix)?
+        q: JobQueue = JobQueue(db, "edges", "e1", prefix).withBackoff(JobBackoff(60, 3600, 0.0))
+
+        # ── Payloads ────────────────────────────────────────────
+        id: int = q.enqueue({"name": "Zoë 🦅 東京", "tags": ["α", "β"], "nested": {"ключ": "значение"}})?
+        job: QueuedJob = q.get(id)?
+        nested: str = Json.encode(job.payload.nested)?
+        name: str = job.payload.name
+        # WORKAROUND (lamc 4.14.0 bug, /tmp/lam-pkg-compiler-bugs/
+        # json_member_comprehension.lam): a comprehension over a json member
+        # does not build; loop instead.
+        tags: list[str] = []
+        for t in job.payload.tags {
+            tag: str = t
+            tags.append(tag)
+        }
+        print(f"unicode payload: {name} [{' '.join(tags)}] {nested}")
+        _ = q.cancel(id)?
+        big: str = "x" * 200000
+        bigId: int = q.enqueue({"blob": big})?
+        bigJob: QueuedJob = q.get(bigId)?
+        blob: str = bigJob.payload.blob
+        print(f"large payload: {len(blob)} characters, {len(bytes(blob))} bytes of ASCII")
+        _ = q.cancel(bigId)?
+        flagsId: int = q.enqueue({"yes": true, "no": false, "nothing": None})?
+        flags: QueuedJob = q.get(flagsId)?
+        encoded: str = Json.encode(flags.payload)?
+        print(f"null and booleans: {flags.payload.yes} {flags.payload.no} null-present={encoded.contains('\"nothing\":null')}")
+        _ = q.cancel(flagsId)?
+
+        # ── Priorities and unique keys ──────────────────────────
+        _ = q.enqueue({"name": "negative"}, 0, -5)?
+        _ = q.enqueue({"name": "zero"}, 0, 0)?
+        _ = q.enqueue({"name": "high"}, 0, 7)?
+        order: list[str] = []
+        for _ in range(3) {
+            claimed: QueuedJob = one(q)?
+            claimedName: str = claimed.payload.name
+            order.append(claimedName)
+            _ = q.complete(claimed)?
+        }
+        print(f"priority order: {','.join(order)}")
+        firstUnique: int = q.enqueue({"name": "u"}, 0, 0, "ключ-🦅")?
+        dupUnique: int = q.enqueue({"name": "u"}, 0, 0, "ключ-🦅")?
+        print(f"unique non-ASCII key: {firstUnique > 0} {dupUnique}")
+        _ = q.cancel(firstUnique)?
+
+        # ── Attempts ────────────────────────────────────────────
+        singleId: int = q.enqueue({"name": "single"}, 0, 0, "", 1)?
+        single: QueuedJob = one(q)?
+        wasLast: bool = single.lastAttempt()
+        state: str = q.fail(single, "boom")?
+        _ = q.enqueue({"name": "three"}, 0, 0, "", 3)?
+        three: QueuedJob = one(q)?
+        print(f"single attempt: last={wasLast} state={state}; three attempts: last={three.lastAttempt()}")
+        _ = q.complete(three)?
+
+        # ── completeIn inside transactions ──────────────────────
+        _ = q.enqueue({"name": "tx"})?
+        inTx: QueuedJob = one(q)?
+        tx: Tx = db.begin()?
+        _ = q.completeIn(tx, inTx)?
+        _ = tx.rollback()?
+        stillRunning: bool = q.get(inTx.id)?.state == "running"
+        tx2: Tx = db.begin()?
+        committed: bool = q.completeIn(tx2, inTx)?
+        _ = tx2.commit()?
+        print(f"completeIn: rollback keeps running={stillRunning}, commit done={committed and q.get(inTx.id)?.state == 'done'}")
+
+        # ── purge ───────────────────────────────────────────────
+        # done: high, zero, negative, three, tx; cancelled: the payload jobs
+        # and the unique one; dead: single.
+        purged: int = q.purge(0, false)?
+        deadLeft: list[QueuedJob] = q.list("dead")?
+        print(f"purge keeps dead: purged={purged} dead left={len(deadLeft)}")
+        _ = singleId
+
+        # ── Prefixes ────────────────────────────────────────────
+        prefixB: str = "lam_jobs_edges_b_"
+        _ = Jobs.dropSchema(db, prefixB)?
+        _ = Jobs.migrate(db, prefixB)?
+        qa: JobQueue = JobQueue(db, "shared-name", "a", prefix)
+        qb: JobQueue = JobQueue(db, "shared-name", "b", prefixB)
+        _ = qa.enqueue({"name": "in a"})?
+        sa: QueueStats = qa.stats()?
+        sb: QueueStats = qb.stats()?
+        print(f"prefixes isolate: a={sa.pending} b={sb.pending}")
+        invalid: str = "none"
+        try {
+            _ = JobQueue(db, "x", "o", "bad-prefix; DROP")
+        } catch ValueError as _e {
+            invalid = "ValueError"
+        }
+        print(f"invalid prefix: {Jobs.checkPrefix('bad-prefix; DROP')} {invalid}")
+        _ = Jobs.dropSchema(db, prefixB)?
+
+        # ── Worker counters ─────────────────────────────────────
+        counted: JobQueue = JobQueue(db, "counted", "c1", prefix).withMaxAttempts(1)
+        for i in range(5) {
+            _ = counted.enqueue({"n": i, "fail": i % 2 == 1})?
+        }
+        handler: Counting = Counting()
+        workers: JobWorkers = JobWorkers(counted, handler.handle, 2).quiet()
+        _ = workers.drain()?
+        print(f"worker counters: completed={workers.completedCount()} failed={workers.failedCount()}")
+
+        # ── Composed mailer ─────────────────────────────────────
+        mailQueue: JobQueue = JobQueue(db, "mail", "producer", prefix)
+        mailer: Mailer = Mailer(mailQueue)
+        pending = [sendTask(mailer, i) for i in range(40)]
+        ids: list[int] = []
+        for task in pending {
+            r: Result[int] = await task
+            ids.append(r.unwrapOr(0))
+        }
+        poolA: JobWorkers = JobWorkers(JobQueue(db, "mail", "pool-a", prefix), mailer.deliver, 3).quiet().withPollInterval(50)
+        poolB: JobWorkers = JobWorkers(JobQueue(db, "mail", "pool-b", prefix), mailer.deliver, 3).quiet().withPollInterval(50)
+        poolA.start()
+        poolB.start()
+        waited: int = 0
+        while len(mailer.outbox) < 40 and waited < 200 {
+            Time.sleepMs(50)
+            waited++
+        }
+        _ = poolA.stop()
+        _ = poolB.stop()
+        print(f"mailer: enqueued={len([i for i in ids if i > 0])} unique ids={len(set(ids))} sent={len(mailer.outbox)} by both pools={len(mailer.byOwner) == 2}")
+        domains: set[str] = set([entry.split("|")[0].split("@")[1] for entry in mailer.outbox])
+        print(f"mailer outbox: {len(set(mailer.outbox))} messages, {len(domains)} domains")
+
+        do {
+            _ = mailQueue.get(999999)?
+            print("missing job: found")
+        } catch err {
+            print(f"missing job: {err.kind}")
+        }
+        _ = Jobs.dropSchema(db, prefix)?
+        print("ok")
+    } catch err {
+        print(f"unexpected: {err}")
+    }
+}

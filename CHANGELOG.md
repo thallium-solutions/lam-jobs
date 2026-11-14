@@ -2,6 +2,19 @@
 
 All notable changes to `@lam/jobs` are documented in this file.
 
+## [1.0.3] - 2026-11-14
+
+### Tests
+
+- `tests/test_queue_payload_edges.lam` (PostgreSQL): non-ASCII, nested,
+  200 000-character, null and boolean payloads; negative priorities;
+  non-ASCII unique keys; single-attempt jobs (`lastAttempt`, straight to
+  dead); `completeIn` inside rolled-back and committed transactions; `purge`
+  keeping dead jobs; schema prefixes isolating queues and invalid prefixes;
+  `completedCount`/`failedCount`; and a composed `Mailer` service: 40 jobs
+  enqueued from async tasks, delivered by two worker pools, checked with
+  comprehensions, `?` and `do/catch`.
+
 ## [1.0.2] - 2026-11-03
 
 ### Changed

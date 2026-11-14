@@ -1,6 +1,6 @@
 [library]
 name = "@lam/jobs"
-version = "1.0.2"
+version = "1.0.3"
 description = "PostgreSQL-backed leases, periodic and cron scheduling, job health, instance heartbeats and a durable job queue for Lammergeier"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]
